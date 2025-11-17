@@ -1,0 +1,10 @@
+{
+  "start_page": 1,
+  "end_page": 100,
+  "target_ids": [],
+  "delay": {
+    "min": 2,
+    "max": 5
+  },
+  "max_threads": 0
+}
