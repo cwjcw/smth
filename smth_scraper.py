@@ -26,9 +26,9 @@ import requests
 from bs4 import BeautifulSoup
 from requests import Response, Session
 
-BASE_URL = "https://www.newsmth.net"
+DEFAULT_BASE_URL = "https://www.newsmth.net"
 DEFAULT_BOARD_NAME = "FamilyLife"
-THREAD_ID_RE = re.compile(r"/article/FamilyLife/(\d+)")
+THREAD_ID_RE = re.compile(r"/article/[^/]+/(\d+)")
 AUTHOR_RE = re.compile(r"发信人:\s*([^(]+)")
 POST_TIME_RE = re.compile(r"发信站:\s*(.+)")
 FROM_RE = re.compile(r"\[FROM:\s*([^\]]+)\]")
@@ -66,6 +66,7 @@ class PostRecord:
     floor: str
     author_id: str
     post_time: str
+    source: str
     ips: str
 
 
@@ -79,6 +80,8 @@ def load_config(config_path: Optional[Path]) -> dict:
         "target_ids": [],
         "delay": None,
         "max_threads": 0,
+        "base_url": DEFAULT_BASE_URL,
+        "max_thread_pages": 0,
     }
     if not config_path:
         return defaults
@@ -96,7 +99,7 @@ def load_config(config_path: Optional[Path]) -> dict:
     return merged
 
 
-def create_session() -> Session:
+def create_session(base_url: str) -> Session:
     """Create a pre-configured HTTP session."""
 
     session = requests.Session()
@@ -116,10 +119,20 @@ def create_session() -> Session:
             "Connection": "keep-alive",
             "Upgrade-Insecure-Requests": "1",
             "Cache-Control": "max-age=0",
-            "Referer": BASE_URL + "/",
+            "Referer": base_url.rstrip("/") + "/",
         }
     )
     return session
+
+
+def warm_up_session(session: Session, base_url: str) -> None:
+    """Best-effort request to obtain cookies before crawling."""
+
+    try:
+        response = session.get(f"{base_url}/nForum/", timeout=10.0)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"初始化会话失败（忽略）: {exc}", file=sys.stderr)
 
 
 def fetch_text(session: Session, url: str, retries: int = 3, timeout: float = 20.0) -> str:
@@ -139,10 +152,11 @@ def fetch_text(session: Session, url: str, retries: int = 3, timeout: float = 20
     raise RuntimeError(f"无法获取 {url}: {last_error}") from last_error
 
 
-def parse_board(html: str, board_page: int, board_name: str) -> Iterator[ThreadLink]:
+def parse_board(html: str, board_page: int, board_name: str, base_url: str) -> Iterator[ThreadLink]:
     """Yield every thread link that appears on a board page."""
 
     soup = BeautifulSoup(html, "html.parser")
+    slug_lower = board_name.lower()
     for cell in soup.select("td.title_9"):
         row = cell.find_parent("tr")
         if row:
@@ -153,11 +167,17 @@ def parse_board(html: str, board_page: int, board_name: str) -> Iterator[ThreadL
         if not anchor:
             continue
         href = anchor["href"]
-        if not href.startswith("/nForum/article/FamilyLife/"):
+        if not href.startswith("/nForum/article/"):
+            continue
+        parts = href.split("/")
+        if len(parts) < 5:
+            continue
+        link_board = parts[3].lower()
+        if link_board != slug_lower:
             continue
         yield ThreadLink(
             title=anchor.get_text(strip=True),
-            url=urljoin(BASE_URL, href),
+            url=urljoin(base_url, href),
             board_page=board_page,
             board_name=board_name,
         )
@@ -189,13 +209,19 @@ def pick_post_time(raw_text: str) -> str:
     """Extract the '发信站' timestamp portion."""
 
     match = POST_TIME_RE.search(raw_text)
-    return match.group(1).strip() if match else ""
+    if not match:
+        return ""
+    value = match.group(1).strip()
+    paren_match = re.search(r"\(([^)]+)\)", value)
+    if paren_match:
+        return paren_match.group(1).strip()
+    return value
 
 
-def collect_ips(content_cell: BeautifulSoup) -> str:
-    """Collect all IP fragments from font classes f0XX except f000/f006."""
+def collect_ips(content_cell: BeautifulSoup) -> List[Tuple[str, str]]:
+    """Collect all IP fragments and their f0XX classes."""
 
-    entries: List[str] = []
+    entries: List[Tuple[str, str]] = []
     seen: Set[Tuple[str, str]] = set()
     for font in content_cell.find_all("font"):
         classes = font.get("class") or []
@@ -218,8 +244,8 @@ def collect_ips(content_cell: BeautifulSoup) -> str:
             if key in seen:
                 continue
             seen.add(key)
-            entries.append(f"{match_cls}:{ip_clean}")
-    return "|".join(entries)
+            entries.append((match_cls, ip_clean))
+    return entries
 
 
 def sleep_with_delay(delay_range: DelayRange) -> None:
@@ -256,7 +282,9 @@ def parse_thread_page(
             continue
         if target_ids and author not in target_ids:
             continue
-        ips = collect_ips(content_cell)
+        ip_entries = collect_ips(content_cell)
+        sources_str = "|".join(cls for cls, _ in ip_entries)
+        ips_str = "|".join(ip for _, ip in ip_entries)
         floor_node = wrap.select_one("span.a-pos")
         floor = floor_node.get_text(strip=True) if floor_node else ""
         records.append(
@@ -270,7 +298,8 @@ def parse_thread_page(
                 floor=floor,
                 author_id=author,
                 post_time=pick_post_time(raw_text),
-                ips=ips,
+                source=sources_str,
+                ips=ips_str,
             )
         )
     return records
@@ -281,6 +310,7 @@ def crawl_thread(
     link: ThreadLink,
     target_ids: Set[str],
     delay_range: DelayRange,
+    max_thread_pages: int,
 ) -> Iterator[PostRecord]:
     """Fetch an entire thread (all available pages)."""
 
@@ -288,6 +318,8 @@ def crawl_thread(
     sleep_with_delay(delay_range)
     soup = BeautifulSoup(first_page_html, "html.parser")
     max_page = extract_max_thread_page(soup)
+    if max_thread_pages:
+        max_page = min(max_page, max_thread_pages)
     for record in parse_thread_page(soup, link, 1, target_ids):
         yield record
 
@@ -349,6 +381,25 @@ def resolve_delay_range(cli_delay: Optional[float], cfg_delay: object) -> DelayR
     return DEFAULT_DELAY_RANGE
 
 
+def resolve_base_url(cli_value: Optional[str], cfg_value: object) -> str:
+    """Determine which SMTH host to talk to."""
+
+    candidate: Optional[str] = None
+    if cli_value:
+        candidate = cli_value
+    elif isinstance(cfg_value, str):
+        candidate = cfg_value
+    if not candidate:
+        candidate = DEFAULT_BASE_URL
+    cleaned = candidate.strip()
+    if not cleaned:
+        cleaned = DEFAULT_BASE_URL
+    cleaned = cleaned.rstrip("/")
+    if not cleaned.startswith(("http://", "https://")):
+        cleaned = f"https://{cleaned}"
+    return cleaned
+
+
 def normalize_board_name(name: Optional[str]) -> str:
     """Normalize the board name (board后面的部分)."""
 
@@ -362,23 +413,25 @@ def normalize_board_name(name: Optional[str]) -> str:
     return cleaned
 
 
-def build_board_base_url(board_name: str) -> str:
+def build_board_base_url(base_url: str, board_name: str) -> str:
     slug = normalize_board_name(board_name)
-    return f"{BASE_URL}/nForum/board/{slug}"
+    return f"{base_url}/nForum/board/{slug}"
 
 
-def build_board_page_url(board_name: str, page: int) -> str:
-    return f"{build_board_base_url(board_name)}?p={page}"
+def build_board_page_url(base_url: str, board_name: str, page: int) -> str:
+    return f"{build_board_base_url(base_url, board_name)}?p={page}"
 
 
 def crawl_boards(
     session: Session,
+    base_url: str,
     boards: Sequence[str],
     start_page: int,
     end_page: int,
     target_ids: Set[str],
     delay_range: DelayRange,
     max_threads: int,
+    max_thread_pages: int,
 ) -> Iterator[PostRecord]:
     """Walk every configured board page inside the requested range."""
 
@@ -388,14 +441,14 @@ def crawl_boards(
         board_slug = normalize_board_name(board)
         print(f"=== 抓取版面 {board_slug} ===")
         for page in range(start_page, end_page + 1):
-            url = build_board_page_url(board_slug, page)
+            url = build_board_page_url(base_url, board_slug, page)
             try:
                 html = fetch_text(session, url)
             except RuntimeError as exc:
                 print(f"[{board_slug}] 第 {page} 页下载失败: {exc}", file=sys.stderr)
                 continue
             sleep_with_delay(delay_range)
-            links = list(parse_board(html, page, board_slug))
+            links = list(parse_board(html, page, board_slug, base_url))
             print(f"[{board_slug}] 第 {page} 页发现 {len(links)} 个主题")
             for link in links:
                 thread_id = link.thread_id
@@ -411,7 +464,7 @@ def crawl_boards(
                 processed_threads += 1
                 print(f"  └─ 抓取[{board_slug}] 主题 {thread_id} 《{link.title}》")
                 try:
-                    for record in crawl_thread(session, link, target_ids, delay_range):
+                    for record in crawl_thread(session, link, target_ids, delay_range, max_thread_pages):
                         yield record
                 except RuntimeError as exc:
                     print(f"    [线程 {thread_id}] 下载失败: {exc}", file=sys.stderr)
@@ -458,6 +511,17 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=None,
         help="限制最多抓取的主题数量 (0 表示不限，用于调试/抽样)",
+    )
+    parser.add_argument(
+        "--base-url",
+        default=None,
+        help="自定义站点根地址 (默认 https://www.newsmth.net)",
+    )
+    parser.add_argument(
+        "--max-thread-pages",
+        type=int,
+        default=None,
+        help="进入每个主题后最多抓取多少页 (0 表示不限)",
     )
     return parser.parse_args()
 
@@ -506,8 +570,21 @@ def main() -> None:
         max_threads = args.max_threads
     max_threads = max(0, max_threads)
 
+    cfg_max_thread_pages = 0
+    try:
+        cfg_max_thread_pages = int(cfg.get("max_thread_pages", 0))
+    except (TypeError, ValueError):
+        cfg_max_thread_pages = 0
+    if args.max_thread_pages is None:
+        max_thread_pages = cfg_max_thread_pages
+    else:
+        max_thread_pages = args.max_thread_pages
+    max_thread_pages = max(0, max_thread_pages)
+
+    base_url = resolve_base_url(args.base_url, cfg.get("base_url"))
     ensure_directory(args.output)
-    session = create_session()
+    session = create_session(base_url)
+    warm_up_session(session, base_url)
     fields = [
         "board_name",
         "board_page",
@@ -518,6 +595,7 @@ def main() -> None:
         "floor",
         "author_id",
         "post_time",
+        "source",
         "ips",
     ]
     total_written = 0
@@ -526,12 +604,14 @@ def main() -> None:
         writer.writeheader()
         for record in crawl_boards(
             session,
+            base_url,
             boards,
             start_page,
             end_page,
             target_ids,
             delay_range,
             max_threads=max_threads,
+            max_thread_pages=max_thread_pages,
         ):
             if not record.thread_id:
                 continue
