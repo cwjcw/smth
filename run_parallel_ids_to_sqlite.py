@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import atexit
 import csv
 import hashlib
 import os
@@ -101,6 +102,8 @@ def parse_post(raw: str, pid: int) -> tuple | None:
 def normalize_title(s: str) -> str:
     t = s.strip()
     t = re.sub(r"^[●\*\s]+", "", t)
+    t = t.replace("　", " ")
+    t = re.sub(r"\s+", "", t)
     return t
 
 
@@ -133,6 +136,28 @@ def write_checkpoint(path: Path, post_id: int) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(str(post_id), encoding="utf-8")
     tmp.replace(path)
+
+
+def append_fail_log(path: Path, line: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as f:
+        f.write(line + "\n")
+
+
+def acquire_lock(lock_file: Path) -> int:
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    os.write(fd, str(os.getpid()).encode("ascii", errors="ignore"))
+    os.close(fd)
+    return os.getpid()
+
+
+def release_lock(lock_file: Path) -> None:
+    try:
+        if lock_file.exists():
+            lock_file.unlink()
+    except Exception:
+        pass
 
 
 async def enter_stock(writer: telnetlib3.TelnetWriter, reader: telnetlib3.TelnetReader, account: Account, board: str) -> None:
@@ -225,6 +250,8 @@ async def worker(
     retries: int,
     short_wait: float,
     long_wait: float,
+    host: str,
+    port: int,
     progress: dict,
     quiet: bool,
 ) -> None:
@@ -238,13 +265,14 @@ async def worker(
             if pid > progress["max_seen_id"]:
                 progress["max_seen_id"] = pid
             success = False
+            fail_reason = ""
             for i in range(retries + 1):
                 try:
                     if writer is None:
                         await asyncio.sleep(random.uniform(0.03, 0.2))
                         reader, writer = await telnetlib3.open_connection(
-                            "bbs.mysmth.net",
-                            23,
+                            host,
+                            port,
                             connect_minwait=0.1,
                             connect_maxwait=1.0,
                             encoding="gb18030",
@@ -253,7 +281,18 @@ async def worker(
                         )
                         await enter_stock(writer, reader, account, board)
                     raw, st = await read_by_id(writer, reader, pid, short_wait, long_wait)
+                    # Unexpectedly fell back to menu/list screen; force reconnect and retry.
+                    if raw and ("主选单" in raw or "讨论区 [Test]" in raw):
+                        try:
+                            writer.close()
+                        except Exception:
+                            pass
+                        reader, writer = None, None
+                        await asyncio.sleep(0.15)
+                        fail_reason = "returned_to_menu"
+                        continue
                 except Exception as e:
+                    fail_reason = f"exception:{type(e).__name__}:{e}"
                     if not quiet:
                         print(f"worker#{wid} reconnect on pid={pid}: {e}")
                     try:
@@ -268,27 +307,38 @@ async def worker(
 
                 if st == "miss" or raw is None:
                     miss += 1
+                    progress["miss"] += 1
                     success = True
                     break
                 rec = parse_post(raw, pid)
                 if rec:
                     await out_q.put(rec)
                     ok += 1
+                    progress["ok"] += 1
                     if progress.get("until_title_norm"):
                         title_norm = normalize_title(rec[3])
-                        if title_norm == progress["until_title_norm"]:
+                        if progress["until_title_norm"] in title_norm:
                             progress["stop"] = True
                             progress["stop_post_id"] = pid
                             progress["stop_title"] = rec[3]
                     success = True
                     break
+                fail_reason = f"parse_failed status={st} raw_len={len(raw) if raw else 0}"
 
             if not success:
                 fail += 1
+                progress["fail"] += 1
+                append_fail_log(
+                    progress["fail_log_file"],
+                    f"post_id={pid}\tworker={wid}\treason={fail_reason or 'unknown'}",
+                )
 
             progress["done"] += 1
             if (not quiet) and progress["done"] % 50 == 0:
-                print(f"progress done={progress['done']} ok={progress['ok_base'] + ok} miss={progress['miss_base'] + miss} fail={progress['fail_base'] + fail}")
+                print(
+                    f"progress done={progress['done']} ok={progress['ok']} "
+                    f"miss={progress['miss']} fail={progress['fail']}"
+                )
     finally:
         try:
             if writer is not None:
@@ -296,9 +346,6 @@ async def worker(
         except Exception:
             pass
 
-    progress["ok_base"] += ok
-    progress["miss_base"] += miss
-    progress["fail_base"] += fail
     if not quiet:
         print(f"worker#{wid} done ok={ok} miss={miss} fail={fail}")
 
@@ -434,7 +481,9 @@ async def sink_writer(
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Parallel SMTH ID scraper -> sqlite")
-    p.add_argument("--start-id", type=int, required=True)
+    p.add_argument("--host", default=os.getenv("SMTH_HOST", "bbs.mysmth.net"))
+    p.add_argument("--port", type=int, default=int(os.getenv("SMTH_PORT", "23")))
+    p.add_argument("--start-id", type=int, default=None)
     p.add_argument("--end-id", type=int, default=None)
     p.add_argument("--board", default=os.getenv("SMTH_BOARD", "stock"))
     p.add_argument("--csv", type=Path, default=Path("data/smth_stock_posts.csv"))
@@ -444,13 +493,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--accounts", default=os.getenv("SMTH_ACCOUNTS", ""))
     p.add_argument("--sessions-per-account", type=int, default=1)
     p.add_argument("--flush-every", type=int, default=500, help="CSV flush interval when CSV is enabled")
-    p.add_argument("--retries", type=int, default=1)
-    p.add_argument("--short-wait", type=float, default=0.12)
-    p.add_argument("--long-wait", type=float, default=0.45)
+    p.add_argument("--retries", type=int, default=2)
+    p.add_argument("--short-wait", type=float, default=0.08)
+    p.add_argument("--long-wait", type=float, default=0.25)
     p.add_argument("--split-mode", choices=["round_robin", "chunk"], default="chunk")
     p.add_argument("--until-title", default=None, help="持续抓取直到命中该标题（忽略 --end-id）")
     p.add_argument("--batch-size", type=int, default=300, help="until 模式每轮分配的ID数量")
     p.add_argument("--checkpoint-file", type=Path, default=Path("data/smth_stock.last_id"))
+    p.add_argument("--fail-log-file", type=Path, default=Path("data/smth_stock.fail.log"))
+    p.add_argument("--lock-file", type=Path, default=Path("data/smth_stock.run.lock"))
+    p.add_argument("--no-lock", action="store_true", help="不启用单实例锁")
     p.add_argument("--no-resume", action="store_true", help="忽略 checkpoint，从 --start-id 开始")
     p.add_argument("--quiet", action="store_true")
     return p.parse_args()
@@ -458,6 +510,34 @@ def parse_args() -> argparse.Namespace:
 
 async def main() -> None:
     args = parse_args()
+    lock_acquired = False
+    if not args.no_lock:
+        try:
+            acquire_lock(args.lock_file)
+            lock_acquired = True
+            atexit.register(release_lock, args.lock_file)
+        except FileExistsError:
+            raise SystemExit(
+                f"lock exists: {args.lock_file} (another run may be active). "
+                "Use --no-lock to bypass."
+            )
+    accounts = parse_accounts(args.accounts)
+    if not accounts:
+        raise SystemExit("missing accounts. set --accounts or SMTH_ACCOUNTS")
+
+    if not args.no_resume:
+        last_id = read_checkpoint(args.checkpoint_file)
+        if last_id is not None and args.start_id is None:
+            args.start_id = last_id + 1
+            if not args.quiet:
+                print(f"resume from checkpoint last_id={last_id} -> start_id={args.start_id}")
+        elif last_id is not None and args.start_id is not None and last_id >= args.start_id:
+            args.start_id = last_id + 1
+            if not args.quiet:
+                print(f"resume from checkpoint last_id={last_id} -> start_id={args.start_id}")
+
+    if args.start_id is None:
+        raise SystemExit("missing --start-id and no checkpoint found")
     if args.until_title is None:
         if args.end_id is None:
             raise SystemExit("missing --end-id when --until-title is not set")
@@ -465,16 +545,6 @@ async def main() -> None:
             raise SystemExit("end-id must be >= start-id")
     elif args.batch_size <= 0:
         raise SystemExit("batch-size must be > 0")
-    accounts = parse_accounts(args.accounts)
-    if not accounts:
-        raise SystemExit("missing accounts. set --accounts or SMTH_ACCOUNTS")
-
-    if not args.no_resume:
-        last_id = read_checkpoint(args.checkpoint_file)
-        if last_id is not None and last_id >= args.start_id:
-            args.start_id = last_id + 1
-            if not args.quiet:
-                print(f"resume from checkpoint last_id={last_id} -> start_id={args.start_id}")
 
     workers_n = len(accounts) * args.sessions_per_account
 
@@ -485,15 +555,19 @@ async def main() -> None:
     )
     progress = {
         "done": 0,
-        "ok_base": 0,
-        "miss_base": 0,
-        "fail_base": 0,
+        "ok": 0,
+        "miss": 0,
+        "fail": 0,
         "stop": False,
         "stop_post_id": None,
         "stop_title": None,
         "until_title_norm": normalize_title(args.until_title) if args.until_title else None,
         "max_seen_id": args.start_id - 1,
+        "fail_log_file": args.fail_log_file,
     }
+
+    args.fail_log_file.parent.mkdir(parents=True, exist_ok=True)
+    args.fail_log_file.write_text("", encoding="utf-8")
 
     def build_tasks(groups: list[list[int]]) -> list[asyncio.Task]:
         tasks_local: list[asyncio.Task] = []
@@ -513,6 +587,8 @@ async def main() -> None:
                             args.retries,
                             args.short_wait,
                             args.long_wait,
+                            args.host,
+                            args.port,
                             progress,
                             args.quiet,
                         )
@@ -548,21 +624,26 @@ async def main() -> None:
             if not args.quiet:
                 print(
                     f"until-progress scanned_to={progress['max_seen_id']} "
-                    f"ok={progress['ok_base']} miss={progress['miss_base']} fail={progress['fail_base']}"
+                    f"ok={progress['ok']} miss={progress['miss']} fail={progress['fail']}"
                 )
             if progress["stop"]:
                 break
         if progress["max_seen_id"] >= args.start_id:
             target_total = progress["max_seen_id"] - args.start_id + 1
 
-    await q.put(None)
-    imported = await writer_task
-    print(f"SUMMARY total={target_total} ok={progress['ok_base']} miss={progress['miss_base']} fail={progress['fail_base']}")
-    print(f"SQLITE db={args.db} imported={imported}")
-    if not args.no_csv:
-        print(f"CSV file={args.csv}")
-    if progress["stop"]:
-        print(f"STOP matched_post_id={progress['stop_post_id']} matched_title={progress['stop_title']}")
+    try:
+        await q.put(None)
+        imported = await writer_task
+        print(f"SUMMARY total={target_total} ok={progress['ok']} miss={progress['miss']} fail={progress['fail']}")
+        print(f"SQLITE db={args.db} imported={imported}")
+        print(f"FAIL_LOG file={args.fail_log_file}")
+        if not args.no_csv:
+            print(f"CSV file={args.csv}")
+        if progress["stop"]:
+            print(f"STOP matched_post_id={progress['stop_post_id']} matched_title={progress['stop_title']}")
+    finally:
+        if lock_acquired:
+            release_lock(args.lock_file)
 
 
 if __name__ == "__main__":
