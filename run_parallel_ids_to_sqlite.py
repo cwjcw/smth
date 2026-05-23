@@ -252,12 +252,14 @@ async def worker(
     long_wait: float,
     host: str,
     port: int,
+    reconnect_after_short_partial: int,
     progress: dict,
     quiet: bool,
 ) -> None:
     reader = None
     writer = None
     ok = miss = fail = 0
+    short_partial_streak = 0
     try:
         for pid in ids:
             if progress.get("stop"):
@@ -312,6 +314,7 @@ async def worker(
                     break
                 rec = parse_post(raw, pid)
                 if rec:
+                    short_partial_streak = 0
                     await out_q.put(rec)
                     ok += 1
                     progress["ok"] += 1
@@ -323,7 +326,25 @@ async def worker(
                             progress["stop_title"] = rec[3]
                     success = True
                     break
-                fail_reason = f"parse_failed status={st} raw_len={len(raw) if raw else 0}"
+                raw_len = len(raw) if raw else 0
+                fail_reason = f"parse_failed status={st} raw_len={raw_len}"
+                if st == "partial" and raw_len < 120:
+                    short_partial_streak += 1
+                    if short_partial_streak >= reconnect_after_short_partial:
+                        try:
+                            if writer is not None:
+                                writer.close()
+                        except Exception:
+                            pass
+                        reader, writer = None, None
+                        short_partial_streak = 0
+                        if not quiet:
+                            print(
+                                f"worker#{wid} reconnect after short partial "
+                                f"pid={pid} raw_len={raw_len}"
+                            )
+                else:
+                    short_partial_streak = 0
 
             if not success:
                 fail += 1
@@ -496,6 +517,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--retries", type=int, default=2)
     p.add_argument("--short-wait", type=float, default=0.08)
     p.add_argument("--long-wait", type=float, default=0.25)
+    p.add_argument("--reconnect-after-short-partial", type=int, default=3)
     p.add_argument("--split-mode", choices=["round_robin", "chunk"], default="chunk")
     p.add_argument("--until-title", default=None, help="持续抓取直到命中该标题（忽略 --end-id）")
     p.add_argument("--batch-size", type=int, default=300, help="until 模式每轮分配的ID数量")
@@ -589,6 +611,7 @@ async def main() -> None:
                             args.long_wait,
                             args.host,
                             args.port,
+                            args.reconnect_after_short_partial,
                             progress,
                             args.quiet,
                         )
