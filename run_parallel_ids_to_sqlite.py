@@ -4,12 +4,14 @@ from __future__ import annotations
 import argparse
 import asyncio
 import csv
+import hashlib
 import os
 import random
 import re
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -100,6 +102,18 @@ def normalize_title(s: str) -> str:
     t = s.strip()
     t = re.sub(r"^[●\*\s]+", "", t)
     return t
+
+
+def make_content_hash(author: str, title: str, post_time: str, body: str) -> str:
+    base = "\n".join(
+        [
+            author.strip(),
+            title.strip(),
+            post_time.strip(),
+            body.strip(),
+        ]
+    )
+    return hashlib.sha1(base.encode("utf-8", errors="ignore")).hexdigest()
 
 
 def read_checkpoint(path: Path) -> Optional[int]:
@@ -317,15 +331,22 @@ def init_sqlite(db_path: Path) -> sqlite3.Connection:
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS posts (
-          post_id INTEGER PRIMARY KEY,
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          post_id INTEGER,
+          content_hash TEXT UNIQUE,
           author TEXT,
           board TEXT,
           title TEXT,
           post_time TEXT,
-          body TEXT
+          body TEXT,
+          first_seen_at TEXT,
+          last_seen_at TEXT,
+          seen_count INTEGER DEFAULT 1
         )
         """
     )
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_post_id ON posts(post_id)")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_posts_post_time ON posts(post_time)")
     return conn
 
 
@@ -333,18 +354,36 @@ def upsert_posts(conn: sqlite3.Connection, rows: list[tuple]) -> int:
     if not rows:
         return 0
     sql = """
-    INSERT INTO posts(post_id,author,board,title,post_time,body)
-    VALUES(?,?,?,?,?,?)
-    ON CONFLICT(post_id) DO UPDATE SET
-      author=excluded.author,
-      board=excluded.board,
-      title=excluded.title,
-      post_time=excluded.post_time,
-      body=excluded.body
+    INSERT INTO posts(
+      post_id, content_hash, author, board, title, post_time, body, first_seen_at, last_seen_at, seen_count
+    )
+    VALUES(?,?,?,?,?,?,?,?,?,?)
+    ON CONFLICT(content_hash) DO UPDATE SET
+      last_seen_at=excluded.last_seen_at,
+      seen_count=posts.seen_count + 1
     """
-    conn.executemany(sql, rows)
+    before = conn.total_changes
+    now = datetime.now(timezone.utc).isoformat()
+    payload = [
+        (
+            post_id,
+            make_content_hash(author, title, post_time, body),
+            author,
+            board,
+            title,
+            post_time,
+            body,
+            now,
+            now,
+            1,
+        )
+        for (post_id, author, board, title, post_time, body) in rows
+    ]
+    conn.executemany(sql, payload)
     conn.commit()
-    return len(rows)
+    # sqlite total_changes includes both inserts and updates.
+    # Keep this as "affected rows" metric.
+    return conn.total_changes - before
 
 
 async def sink_writer(
