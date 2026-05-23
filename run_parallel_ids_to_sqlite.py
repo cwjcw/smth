@@ -7,9 +7,11 @@ import csv
 import os
 import random
 import re
+import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Optional
 
 import telnetlib3
 
@@ -92,6 +94,31 @@ def parse_post(raw: str, pid: int) -> tuple | None:
     if author.endswith(","):
         author = author[:-1].strip()
     return (pid, author, board, title, post_time, body)
+
+
+def normalize_title(s: str) -> str:
+    t = s.strip()
+    t = re.sub(r"^[●\*\s]+", "", t)
+    return t
+
+
+def read_checkpoint(path: Path) -> Optional[int]:
+    if not path.exists():
+        return None
+    try:
+        raw = path.read_text(encoding="utf-8").strip()
+        if not raw:
+            return None
+        return int(raw)
+    except Exception:
+        return None
+
+
+def write_checkpoint(path: Path, post_id: int) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(str(post_id), encoding="utf-8")
+    tmp.replace(path)
 
 
 async def enter_stock(writer: telnetlib3.TelnetWriter, reader: telnetlib3.TelnetReader, account: Account, board: str) -> None:
@@ -192,6 +219,10 @@ async def worker(
     ok = miss = fail = 0
     try:
         for pid in ids:
+            if progress.get("stop"):
+                break
+            if pid > progress["max_seen_id"]:
+                progress["max_seen_id"] = pid
             success = False
             for i in range(retries + 1):
                 try:
@@ -229,6 +260,12 @@ async def worker(
                 if rec:
                     await out_q.put(rec)
                     ok += 1
+                    if progress.get("until_title_norm"):
+                        title_norm = normalize_title(rec[3])
+                        if title_norm == progress["until_title_norm"]:
+                            progress["stop"] = True
+                            progress["stop_post_id"] = pid
+                            progress["stop_title"] = rec[3]
                     success = True
                     break
 
@@ -272,86 +309,221 @@ def split_ids_round_robin(ids: list[int], n: int) -> list[list[int]]:
     return buckets
 
 
-async def csv_writer(csv_path: Path, q: asyncio.Queue, flush_every: int) -> None:
-    csv_path.parent.mkdir(parents=True, exist_ok=True)
-    with csv_path.open("a", newline="", encoding="utf-8-sig") as f:
-        w = csv.writer(f)
+def init_sqlite(db_path: Path) -> sqlite3.Connection:
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS posts (
+          post_id INTEGER PRIMARY KEY,
+          author TEXT,
+          board TEXT,
+          title TEXT,
+          post_time TEXT,
+          body TEXT
+        )
+        """
+    )
+    return conn
+
+
+def upsert_posts(conn: sqlite3.Connection, rows: list[tuple]) -> int:
+    if not rows:
+        return 0
+    sql = """
+    INSERT INTO posts(post_id,author,board,title,post_time,body)
+    VALUES(?,?,?,?,?,?)
+    ON CONFLICT(post_id) DO UPDATE SET
+      author=excluded.author,
+      board=excluded.board,
+      title=excluded.title,
+      post_time=excluded.post_time,
+      body=excluded.body
+    """
+    conn.executemany(sql, rows)
+    conn.commit()
+    return len(rows)
+
+
+async def sink_writer(
+    q: asyncio.Queue,
+    db_path: Path,
+    sqlite_batch: int,
+    csv_path: Path | None,
+    csv_flush_every: int,
+) -> int:
+    conn = init_sqlite(db_path)
+    csv_file = None
+    csv_writer_obj = None
+    if csv_path is not None:
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_file = csv_path.open("a", newline="", encoding="utf-8-sig")
+        csv_writer_obj = csv.writer(csv_file)
         if csv_path.stat().st_size == 0:
-            w.writerow(["post_id", "author", "board", "title", "post_time", "body"])
-        n = 0
+            csv_writer_obj.writerow(["post_id", "author", "board", "title", "post_time", "body"])
+
+    sqlite_buf: list[tuple] = []
+    csv_n = 0
+    total = 0
+    try:
         while True:
             item = await q.get()
             if item is None:
                 break
-            w.writerow(item)
-            n += 1
-            if n >= flush_every:
-                f.flush()
-                n = 0
-        f.flush()
+            sqlite_buf.append(item)
+            if csv_writer_obj is not None:
+                csv_writer_obj.writerow(item)
+                csv_n += 1
+                if csv_n >= csv_flush_every:
+                    csv_file.flush()
+                    csv_n = 0
+            if len(sqlite_buf) >= sqlite_batch:
+                total += upsert_posts(conn, sqlite_buf)
+                sqlite_buf = []
+        if sqlite_buf:
+            total += upsert_posts(conn, sqlite_buf)
+        if csv_file is not None:
+            csv_file.flush()
+    finally:
+        conn.close()
+        if csv_file is not None:
+            csv_file.close()
+    return total
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Parallel SMTH ID scraper -> sqlite")
     p.add_argument("--start-id", type=int, required=True)
-    p.add_argument("--end-id", type=int, required=True)
+    p.add_argument("--end-id", type=int, default=None)
     p.add_argument("--board", default=os.getenv("SMTH_BOARD", "stock"))
     p.add_argument("--csv", type=Path, default=Path("data/smth_stock_posts.csv"))
+    p.add_argument("--no-csv", action="store_true")
+    p.add_argument("--db", type=Path, default=Path("data/smth_stock.db"))
+    p.add_argument("--sqlite-batch", type=int, default=2000)
     p.add_argument("--accounts", default=os.getenv("SMTH_ACCOUNTS", ""))
-    p.add_argument("--sessions-per-account", type=int, default=3)
-    p.add_argument("--flush-every", type=int, default=500)
+    p.add_argument("--sessions-per-account", type=int, default=1)
+    p.add_argument("--flush-every", type=int, default=500, help="CSV flush interval when CSV is enabled")
     p.add_argument("--retries", type=int, default=1)
     p.add_argument("--short-wait", type=float, default=0.12)
     p.add_argument("--long-wait", type=float, default=0.45)
     p.add_argument("--split-mode", choices=["round_robin", "chunk"], default="chunk")
+    p.add_argument("--until-title", default=None, help="持续抓取直到命中该标题（忽略 --end-id）")
+    p.add_argument("--batch-size", type=int, default=300, help="until 模式每轮分配的ID数量")
+    p.add_argument("--checkpoint-file", type=Path, default=Path("data/smth_stock.last_id"))
+    p.add_argument("--no-resume", action="store_true", help="忽略 checkpoint，从 --start-id 开始")
     p.add_argument("--quiet", action="store_true")
     return p.parse_args()
 
 
 async def main() -> None:
     args = parse_args()
-    if args.end_id < args.start_id:
-        raise SystemExit("end-id must be >= start-id")
+    if args.until_title is None:
+        if args.end_id is None:
+            raise SystemExit("missing --end-id when --until-title is not set")
+        if args.end_id < args.start_id:
+            raise SystemExit("end-id must be >= start-id")
+    elif args.batch_size <= 0:
+        raise SystemExit("batch-size must be > 0")
     accounts = parse_accounts(args.accounts)
     if not accounts:
         raise SystemExit("missing accounts. set --accounts or SMTH_ACCOUNTS")
 
+    if not args.no_resume:
+        last_id = read_checkpoint(args.checkpoint_file)
+        if last_id is not None and last_id >= args.start_id:
+            args.start_id = last_id + 1
+            if not args.quiet:
+                print(f"resume from checkpoint last_id={last_id} -> start_id={args.start_id}")
+
     workers_n = len(accounts) * args.sessions_per_account
-    ids = list(range(args.start_id, args.end_id + 1))
-    groups = split_ids_chunk(ids, workers_n) if args.split_mode == "chunk" else split_ids_round_robin(ids, workers_n)
 
     q: asyncio.Queue = asyncio.Queue(maxsize=5000)
-    writer_task = asyncio.create_task(csv_writer(args.csv, q, args.flush_every))
-    progress = {"done": 0, "ok_base": 0, "miss_base": 0, "fail_base": 0}
+    csv_path = None if args.no_csv else args.csv
+    writer_task = asyncio.create_task(
+        sink_writer(q, args.db, args.sqlite_batch, csv_path, args.flush_every)
+    )
+    progress = {
+        "done": 0,
+        "ok_base": 0,
+        "miss_base": 0,
+        "fail_base": 0,
+        "stop": False,
+        "stop_post_id": None,
+        "stop_title": None,
+        "until_title_norm": normalize_title(args.until_title) if args.until_title else None,
+        "max_seen_id": args.start_id - 1,
+    }
 
-    tasks = []
-    wid = 0
-    for acc in accounts:
-        for _ in range(args.sessions_per_account):
-            if wid >= len(groups):
-                break
-            tasks.append(
-                asyncio.create_task(
-                    worker(
-                        wid,
-                        acc,
-                        args.board,
-                        groups[wid],
-                        q,
-                        args.retries,
-                        args.short_wait,
-                        args.long_wait,
-                        progress,
-                        args.quiet,
+    def build_tasks(groups: list[list[int]]) -> list[asyncio.Task]:
+        tasks_local: list[asyncio.Task] = []
+        wid = 0
+        for acc in accounts:
+            for _ in range(args.sessions_per_account):
+                if wid >= len(groups):
+                    break
+                tasks_local.append(
+                    asyncio.create_task(
+                        worker(
+                            wid,
+                            acc,
+                            args.board,
+                            groups[wid],
+                            q,
+                            args.retries,
+                            args.short_wait,
+                            args.long_wait,
+                            progress,
+                            args.quiet,
+                        )
                     )
                 )
-            )
-            wid += 1
+                wid += 1
+        return tasks_local
 
-    await asyncio.gather(*tasks)
+    if args.until_title is None:
+        if args.end_id < args.start_id:
+            await q.put(None)
+            await writer_task
+            print("SUMMARY total=0 ok=0 miss=0 fail=0")
+            print(f"SQLITE db={args.db} imported=0")
+            return
+        ids = list(range(args.start_id, args.end_id + 1))
+        groups = split_ids_chunk(ids, workers_n) if args.split_mode == "chunk" else split_ids_round_robin(ids, workers_n)
+        await asyncio.gather(*build_tasks(groups))
+        if progress["max_seen_id"] >= args.start_id:
+            write_checkpoint(args.checkpoint_file, progress["max_seen_id"])
+        target_total = len(ids)
+    else:
+        cursor = args.start_id
+        target_total = 0
+        while not progress["stop"]:
+            ids = list(range(cursor, cursor + args.batch_size))
+            # In until mode, prefer round-robin to reduce overshoot after stop signal.
+            groups = split_ids_round_robin(ids, workers_n)
+            await asyncio.gather(*build_tasks(groups))
+            cursor += args.batch_size
+            if progress["max_seen_id"] >= args.start_id:
+                write_checkpoint(args.checkpoint_file, progress["max_seen_id"])
+            if not args.quiet:
+                print(
+                    f"until-progress scanned_to={progress['max_seen_id']} "
+                    f"ok={progress['ok_base']} miss={progress['miss_base']} fail={progress['fail_base']}"
+                )
+            if progress["stop"]:
+                break
+        if progress["max_seen_id"] >= args.start_id:
+            target_total = progress["max_seen_id"] - args.start_id + 1
+
     await q.put(None)
-    await writer_task
-    print(f"SUMMARY total={len(ids)} ok={progress['ok_base']} miss={progress['miss_base']} fail={progress['fail_base']}")
+    imported = await writer_task
+    print(f"SUMMARY total={target_total} ok={progress['ok_base']} miss={progress['miss_base']} fail={progress['fail_base']}")
+    print(f"SQLITE db={args.db} imported={imported}")
+    if not args.no_csv:
+        print(f"CSV file={args.csv}")
+    if progress["stop"]:
+        print(f"STOP matched_post_id={progress['stop_post_id']} matched_title={progress['stop_title']}")
 
 
 if __name__ == "__main__":
