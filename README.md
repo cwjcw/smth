@@ -125,6 +125,8 @@ python run_parallel_ids_to_sqlite.py \
 - `--csv`：CSV 路径（不加 `--no-csv` 时生效）
 - `--sqlite-batch`：SQLite 批量写入大小；正式运行建议 `50`
 - `--reconnect-after-short-partial`：连续 partial 返回后的自动重连阈值，建议 `3`；参数名保留用于兼容旧命令。
+- `--login-fail-sleep`：登录失败后等待多少秒再重试，默认 `600`。
+- 登录成功但未进入目标版面时，脚本会关闭当前连接并立即重连。
 - `--batch-size`：持续模式每轮分配 ID 数，默认 `300`
 - `--fail-log-file`：失败日志路径，默认 `data/smth_stock.fail.log`
 - `--lock-file`：单实例锁文件，默认 `data/smth_stock.run.lock`

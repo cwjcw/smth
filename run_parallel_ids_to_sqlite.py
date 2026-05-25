@@ -31,12 +31,45 @@ K_BOARD = "信区:"
 K_TITLE = "题:"
 K_INNER = "站内"
 K_QUOTE = "【 "
+LOGIN_FAIL_MARKERS = [
+    "密码错误",
+    "密码不正确",
+    "登录失败",
+    "登陆失败",
+    "错误的密码",
+    "用户不存在",
+    "请输入正确",
+    "请重新输入",
+    "Login incorrect",
+    "incorrect",
+]
+LOGIN_SUCCESS_MARKERS = [
+    "主选单",
+    "讨论区",
+    "窗口数过多",
+    "踢除",
+    "目前选择",
+    "按任意键继续",
+    "上次在",
+    "积分",
+    "信箱",
+    "等级",
+    "身份",
+]
 
 
 @dataclass
 class Account:
     username: str
     password: str
+
+
+class LoginFailed(RuntimeError):
+    pass
+
+
+class BoardEnterFailed(RuntimeError):
+    pass
 
 
 def clean(s: str) -> str:
@@ -60,6 +93,10 @@ async def rd(reader: telnetlib3.TelnetReader, sec: float = 0.8) -> str:
 async def send(writer: telnetlib3.TelnetWriter, s: str) -> None:
     writer.write(s)
     await writer.drain()
+
+
+def contains_any(s: str, markers: list[str]) -> bool:
+    return any(marker in s for marker in markers)
 
 
 def parse_post(raw: str, pid: int) -> tuple | None:
@@ -169,29 +206,43 @@ def release_lock(lock_file: Path) -> None:
 
 
 async def enter_stock(writer: telnetlib3.TelnetWriter, reader: telnetlib3.TelnetReader, account: Account, board: str) -> None:
-    await rd(reader, 2.8)
+    seen: list[str] = []
+    seen.append(await rd(reader, 2.8))
     await send(writer, account.username + "\r\n")
-    await rd(reader, 1.2)
+    seen.append(await rd(reader, 1.2))
     await send(writer, account.password + "\r\n")
     t = await rd(reader, 1.8)
+    seen.append(t)
+    merged = "\n".join(seen)
+    if contains_any(merged, LOGIN_FAIL_MARKERS):
+        raise LoginFailed(format_fail_preview(merged))
+    if not contains_any(merged, LOGIN_SUCCESS_MARKERS):
+        raise LoginFailed(f"login status unknown: {format_fail_preview(merged)}")
     if "窗口数过多" in t or "踢除" in t:
         await send(writer, "1\r\n")
-        await rd(reader, 1.2)
+        seen.append(await rd(reader, 1.2))
 
     await send(writer, "\r\n")
-    await rd(reader, 0.8)
+    seen.append(await rd(reader, 0.8))
     await send(writer, "\r\n")
-    await rd(reader, 0.8)
+    seen.append(await rd(reader, 0.8))
     for _ in range(4):
         await send(writer, " ")
-        await rd(reader, 0.8)
+        seen.append(await rd(reader, 0.8))
 
     await send(writer, "f")
-    await rd(reader, 0.6)
+    seen.append(await rd(reader, 0.6))
     await send(writer, "\r\n")
-    await rd(reader, 0.8)
+    seen.append(await rd(reader, 0.8))
     await send(writer, "\r\n")
-    await rd(reader, 1.2)
+    seen.append(await rd(reader, 1.2))
+
+    merged = "\n".join(seen)
+    if contains_any(merged, LOGIN_FAIL_MARKERS):
+        raise LoginFailed(format_fail_preview(merged))
+    board_marker = f"讨论区 [{board.capitalize()}]"
+    if board_marker not in merged and board.lower() not in merged.lower():
+        raise BoardEnterFailed(format_fail_preview(merged))
 
 
 async def read_by_id(writer: telnetlib3.TelnetWriter, reader: telnetlib3.TelnetReader, pid: int, short_wait: float, long_wait: float) -> tuple[str | None, str]:
@@ -261,6 +312,7 @@ async def worker(
     host: str,
     port: int,
     reconnect_after_short_partial: int,
+    login_fail_sleep: float,
     progress: dict,
     quiet: bool,
 ) -> None:
@@ -277,7 +329,8 @@ async def worker(
             success = False
             fail_reason = ""
             raw = None
-            for i in range(retries + 1):
+            i = 0
+            while i <= retries:
                 try:
                     if writer is None:
                         await asyncio.sleep(random.uniform(0.03, 0.2))
@@ -301,7 +354,49 @@ async def worker(
                         reader, writer = None, None
                         await asyncio.sleep(0.15)
                         fail_reason = "returned_to_menu"
+                        i += 1
                         continue
+                except LoginFailed as e:
+                    fail_reason = f"login_failed:{e}"
+                    append_fail_log(
+                        progress["fail_log_file"],
+                        f"post_id={pid}\tworker={wid}\taccount={account.username}"
+                        f"\treason={fail_reason}\traw_preview=",
+                    )
+                    if not quiet:
+                        print(
+                            f"worker#{wid} account={account.username} login failed; "
+                            f"sleep {login_fail_sleep:.0f}s before retry"
+                        )
+                    try:
+                        if writer is not None:
+                            writer.close()
+                    except Exception:
+                        pass
+                    reader, writer = None, None
+                    await asyncio.sleep(login_fail_sleep)
+                    continue
+                except BoardEnterFailed as e:
+                    fail_reason = f"board_enter_failed:{e}"
+                    append_fail_log(
+                        progress["fail_log_file"],
+                        f"post_id={pid}\tworker={wid}\taccount={account.username}"
+                        f"\treason={fail_reason}\traw_preview=",
+                    )
+                    if not quiet:
+                        print(
+                            f"worker#{wid} account={account.username} did not enter "
+                            f"{board}; reconnect"
+                        )
+                    try:
+                        if writer is not None:
+                            writer.close()
+                    except Exception:
+                        pass
+                    reader, writer = None, None
+                    await asyncio.sleep(0.5 + random.uniform(0, 0.5))
+                    i += 1
+                    continue
                 except Exception as e:
                     fail_reason = f"exception:{type(e).__name__}:{e}"
                     if not quiet:
@@ -314,6 +409,7 @@ async def worker(
                     reader, writer = None, None
                     backoff = 0.25 * (2 ** min(i, 3)) + random.uniform(0, 0.25)
                     await asyncio.sleep(backoff)
+                    i += 1
                     continue
 
                 if st == "miss" or raw is None:
@@ -354,6 +450,7 @@ async def worker(
                             )
                 else:
                     short_partial_streak = 0
+                i += 1
 
             if not success:
                 fail += 1
@@ -533,6 +630,7 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help="连续 partial 解析失败后的自动重连阈值，参数名保留用于兼容旧命令",
     )
+    p.add_argument("--login-fail-sleep", type=float, default=600, help="登录失败后等待多少秒再重试")
     p.add_argument("--split-mode", choices=["round_robin", "chunk"], default="chunk")
     p.add_argument("--until-title", default=None, help="持续抓取直到命中该标题（忽略 --end-id）")
     p.add_argument("--batch-size", type=int, default=300, help="until 模式每轮分配的ID数量")
@@ -627,6 +725,7 @@ async def main() -> None:
                             args.host,
                             args.port,
                             args.reconnect_after_short_partial,
+                            args.login_fail_sleep,
                             progress,
                             args.quiet,
                         )
