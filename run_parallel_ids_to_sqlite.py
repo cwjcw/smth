@@ -216,8 +216,6 @@ async def enter_stock(writer: telnetlib3.TelnetWriter, reader: telnetlib3.Telnet
     merged = "\n".join(seen)
     if contains_any(merged, LOGIN_FAIL_MARKERS):
         raise LoginFailed(format_fail_preview(merged))
-    if not contains_any(merged, LOGIN_SUCCESS_MARKERS):
-        raise LoginFailed(f"login status unknown: {format_fail_preview(merged)}")
     if "窗口数过多" in t or "踢除" in t:
         await send(writer, "1\r\n")
         seen.append(await rd(reader, 1.2))
