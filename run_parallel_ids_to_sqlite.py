@@ -144,6 +144,14 @@ def append_fail_log(path: Path, line: str) -> None:
         f.write(line + "\n")
 
 
+def format_fail_preview(raw: str | None, limit: int = 160) -> str:
+    if not raw:
+        return ""
+    preview = clean(raw)
+    preview = re.sub(r"\s+", " ", preview).strip()
+    return preview[:limit]
+
+
 def acquire_lock(lock_file: Path) -> int:
     lock_file.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(lock_file, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
@@ -268,6 +276,7 @@ async def worker(
                 progress["max_seen_id"] = pid
             success = False
             fail_reason = ""
+            raw = None
             for i in range(retries + 1):
                 try:
                     if writer is None:
@@ -328,7 +337,7 @@ async def worker(
                     break
                 raw_len = len(raw) if raw else 0
                 fail_reason = f"parse_failed status={st} raw_len={raw_len}"
-                if st == "partial" and raw_len < 120:
+                if st == "partial":
                     short_partial_streak += 1
                     if short_partial_streak >= reconnect_after_short_partial:
                         try:
@@ -340,7 +349,7 @@ async def worker(
                         short_partial_streak = 0
                         if not quiet:
                             print(
-                                f"worker#{wid} reconnect after short partial "
+                                f"worker#{wid} reconnect after partial "
                                 f"pid={pid} raw_len={raw_len}"
                             )
                 else:
@@ -351,7 +360,8 @@ async def worker(
                 progress["fail"] += 1
                 append_fail_log(
                     progress["fail_log_file"],
-                    f"post_id={pid}\tworker={wid}\treason={fail_reason or 'unknown'}",
+                    f"post_id={pid}\tworker={wid}\treason={fail_reason or 'unknown'}"
+                    f"\traw_preview={format_fail_preview(raw)}",
                 )
 
             progress["done"] += 1
@@ -517,7 +527,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--retries", type=int, default=2)
     p.add_argument("--short-wait", type=float, default=0.08)
     p.add_argument("--long-wait", type=float, default=0.25)
-    p.add_argument("--reconnect-after-short-partial", type=int, default=3)
+    p.add_argument(
+        "--reconnect-after-short-partial",
+        type=int,
+        default=3,
+        help="连续 partial 解析失败后的自动重连阈值，参数名保留用于兼容旧命令",
+    )
     p.add_argument("--split-mode", choices=["round_robin", "chunk"], default="chunk")
     p.add_argument("--until-title", default=None, help="持续抓取直到命中该标题（忽略 --end-id）")
     p.add_argument("--batch-size", type=int, default=300, help="until 模式每轮分配的ID数量")

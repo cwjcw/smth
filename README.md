@@ -77,7 +77,7 @@ python run_parallel_ids_to_sqlite.py \
 - `--sessions-per-account 1`：每个 SMTH 账号只登录 1 个窗口。
 - `--split-mode round_robin`：多个账号轮流分配 ID。
 - `--sqlite-batch 50`：每 50 条提交一次，运行中也能看到数据库逐步有数据。
-- `--reconnect-after-short-partial 3`：连续 3 次拿到过短 partial 返回时自动重连该账号。
+- `--reconnect-after-short-partial 3`：连续 3 次拿到 partial 返回时自动重连该账号。
 - `--no-resume`：本次强制从 500000 开始，不使用历史 checkpoint。
 
 ### 3) 续跑模式（从上次 checkpoint 继续）
@@ -111,7 +111,7 @@ python run_parallel_ids_to_sqlite.py \
 - 作用：防止同时启动多个脚本，避免同一个 SMTH 账号重复登录。
 - 可用 `--no-lock` 绕过锁（一般不建议）。
 - 默认失败日志：`data/smth_stock.fail.log`
-- 失败日志会记录失败的 `post_id`、worker 和原因。
+- 失败日志会记录失败的 `post_id`、worker、原因和一段 `raw_preview`，便于判断卡在哪个页面。
 
 ## 主要参数
 
@@ -124,7 +124,7 @@ python run_parallel_ids_to_sqlite.py \
 - `--no-csv`：不输出 CSV（推荐大批量时开启）
 - `--csv`：CSV 路径（不加 `--no-csv` 时生效）
 - `--sqlite-batch`：SQLite 批量写入大小；正式运行建议 `50`
-- `--reconnect-after-short-partial`：连续短 partial 返回后的自动重连阈值，建议 `3`
+- `--reconnect-after-short-partial`：连续 partial 返回后的自动重连阈值，建议 `3`；参数名保留用于兼容旧命令。
 - `--batch-size`：持续模式每轮分配 ID 数，默认 `300`
 - `--fail-log-file`：失败日志路径，默认 `data/smth_stock.fail.log`
 - `--lock-file`：单实例锁文件，默认 `data/smth_stock.run.lock`
