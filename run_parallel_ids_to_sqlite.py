@@ -354,7 +354,7 @@ async def worker(
     wid: int,
     account: Account,
     board: str,
-    ids: list[int],
+    ids: list[int] | asyncio.Queue,
     out_q: asyncio.Queue,
     retries: int,
     short_wait: float,
@@ -373,6 +373,8 @@ async def worker(
     short_partial_streak = 0
     audit_block_streak = 0
     account_disabled = False
+    id_queue = ids if isinstance(ids, asyncio.Queue) else None
+    id_iter = iter(ids) if id_queue is None else None
 
     async def wait_for_connect_slot() -> None:
         while True:
@@ -396,9 +398,20 @@ async def worker(
             await asyncio.sleep(wait_for)
 
     try:
-        for pid in ids:
-            if progress.get("stop"):
-                break
+        while True:
+            if id_queue is None:
+                try:
+                    pid = next(id_iter)
+                except StopIteration:
+                    break
+                if progress.get("stop"):
+                    break
+            else:
+                pid = await id_queue.get()
+                if pid is None:
+                    break
+                if progress.get("stop"):
+                    continue
             if pid > progress["max_seen_id"]:
                 progress["max_seen_id"] = pid
             success = False
@@ -884,6 +897,69 @@ async def main() -> None:
             wid += 1
         return tasks_local
 
+    def build_queue_tasks(id_q: asyncio.Queue) -> list[asyncio.Task]:
+        tasks_local: list[asyncio.Task] = []
+        for wid, acc in enumerate(accounts):
+            tasks_local.append(
+                asyncio.create_task(
+                    worker(
+                        wid,
+                        acc,
+                        args.board,
+                        id_q,
+                        q,
+                        args.retries,
+                        args.short_wait,
+                        args.long_wait,
+                        args.host,
+                        args.port,
+                        args.reconnect_after_short_partial,
+                        args.min_reconnect_interval,
+                        args.login_fail_sleep,
+                        progress,
+                        args.quiet,
+                    )
+                )
+            )
+        return tasks_local
+
+    async def feed_until_ids(id_q: asyncio.Queue) -> None:
+        cursor = args.start_id
+        disabled_all = False
+        while not progress["stop"]:
+            disabled_all = (
+                len(progress["runtime_disabled_accounts"]) >= workers_n
+            )
+            if disabled_all:
+                break
+            await id_q.put(cursor)
+            cursor += 1
+        if not disabled_all:
+            for _ in range(workers_n):
+                await id_q.put(None)
+
+    async def monitor_until_progress(done_event: asyncio.Event) -> None:
+        last_checkpoint = args.start_id - 1
+        last_report_done = 0
+        while not done_event.is_set():
+            try:
+                await asyncio.wait_for(done_event.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                pass
+            if progress["max_seen_id"] > last_checkpoint:
+                write_checkpoint(args.checkpoint_file, progress["max_seen_id"])
+                last_checkpoint = progress["max_seen_id"]
+            should_report = (
+                progress["done"] - last_report_done >= args.batch_size
+                or (done_event.is_set() and progress["done"] > last_report_done)
+            )
+            if (not args.quiet) and should_report:
+                print(
+                    f"until-progress scanned_to={progress['max_seen_id']} "
+                    f"ok={progress['ok']} miss={progress['miss']} fail={progress['fail']}"
+                )
+                last_report_done = progress["done"]
+
     if args.until_title is None:
         if args.end_id < args.start_id:
             await q.put(None)
@@ -898,25 +974,19 @@ async def main() -> None:
             write_checkpoint(args.checkpoint_file, progress["max_seen_id"])
         target_total = len(ids)
     else:
-        cursor = args.start_id
-        target_total = 0
-        while not progress["stop"]:
-            ids = list(range(cursor, cursor + args.batch_size))
-            # In until mode, prefer round-robin to reduce overshoot after stop signal.
-            groups = split_ids_round_robin(ids, workers_n)
-            await asyncio.gather(*build_tasks(groups))
-            cursor += args.batch_size
-            if progress["max_seen_id"] >= args.start_id:
-                write_checkpoint(args.checkpoint_file, progress["max_seen_id"])
-            if not args.quiet:
-                print(
-                    f"until-progress scanned_to={progress['max_seen_id']} "
-                    f"ok={progress['ok']} miss={progress['miss']} fail={progress['fail']}"
-                )
-            if progress["stop"]:
-                break
+        id_q: asyncio.Queue = asyncio.Queue(maxsize=args.batch_size)
+        until_done = asyncio.Event()
+        worker_tasks = build_queue_tasks(id_q)
+        monitor_task = asyncio.create_task(monitor_until_progress(until_done))
+        producer_task = asyncio.create_task(feed_until_ids(id_q))
+        await producer_task
+        await asyncio.gather(*worker_tasks)
+        until_done.set()
+        await monitor_task
         if progress["max_seen_id"] >= args.start_id:
             target_total = progress["max_seen_id"] - args.start_id + 1
+        else:
+            target_total = 0
 
     try:
         await q.put(None)

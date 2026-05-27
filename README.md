@@ -9,6 +9,7 @@
 - 支持断点续跑（checkpoint）
 - 支持“持续抓取直到命中指定标题后自动停止”
 - 支持低频重连、账号禁用、审核限制自动熔断
+- 持续抓取模式使用账号长连接 worker，不会按批次主动重登
 
 ## 环境准备
 
@@ -144,7 +145,7 @@ python run_parallel_ids_to_sqlite.py \
 - `--max-audit-blocks`：同一账号连续遇到审核限制提示多少次后停用；默认 `3`。
 - `--login-fail-sleep`：登录失败后等待多少秒再重试，默认 `600`。
 - 登录成功但未进入目标版面时，脚本会关闭当前连接，并遵守 `--min-reconnect-interval` 后再尝试重连。
-- `--batch-size`：持续模式每轮分配 ID 数，默认 `300`
+- `--batch-size`：持续模式 ID 队列缓冲和 `until-progress` 汇报粒度，默认 `300`；不会触发账号按批次重登
 - `--fail-log-file`：失败日志路径，默认 `data/smth_stock.fail.log`
 - `--lock-file`：单实例锁文件，默认 `data/smth_stock.run.lock`
 
