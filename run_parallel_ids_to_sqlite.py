@@ -18,6 +18,7 @@ from typing import Optional
 
 import telnetlib3
 
+ROOT = Path(__file__).resolve().parent
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 DT_RE = re.compile(
     r"\b(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)\s+"
@@ -56,6 +57,10 @@ LOGIN_SUCCESS_MARKERS = [
     "等级",
     "身份",
 ]
+AUDIT_BLOCK_MARKERS = [
+    "全站审核中",
+    "暂不能查看本文内容",
+]
 
 
 @dataclass
@@ -70,6 +75,20 @@ class LoginFailed(RuntimeError):
 
 class BoardEnterFailed(RuntimeError):
     pass
+
+
+def load_env_file(path: Path) -> None:
+    if not path.exists():
+        return
+    for line in path.read_text(encoding="utf-8-sig").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, value = stripped.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip("'\"")
+        if key:
+            os.environ.setdefault(key, value)
 
 
 def clean(s: str) -> str:
@@ -97,6 +116,17 @@ async def send(writer: telnetlib3.TelnetWriter, s: str) -> None:
 
 def contains_any(s: str, markers: list[str]) -> bool:
     return any(marker in s for marker in markers)
+
+
+def has_board_marker(s: str, board: str) -> bool:
+    low = s.lower()
+    board_low = board.lower()
+    markers = [
+        f"讨论区 [{board_low}]",
+        f"信区: {board_low}",
+        f"信区：{board_low}",
+    ]
+    return any(marker in low for marker in markers)
 
 
 def parse_post(raw: str, pid: int) -> tuple | None:
@@ -238,8 +268,7 @@ async def enter_stock(writer: telnetlib3.TelnetWriter, reader: telnetlib3.Telnet
     merged = "\n".join(seen)
     if contains_any(merged, LOGIN_FAIL_MARKERS):
         raise LoginFailed(format_fail_preview(merged))
-    board_marker = f"讨论区 [{board.capitalize()}]"
-    if board_marker not in merged and board.lower() not in merged.lower():
+    if not has_board_marker(merged, board):
         raise BoardEnterFailed(format_fail_preview(merged))
 
 
@@ -297,6 +326,29 @@ def parse_accounts(raw: str) -> list[Account]:
     return out
 
 
+def parse_account_names(raw: str) -> set[str]:
+    return {name.strip() for name in raw.split(",") if name.strip()}
+
+
+def filter_disabled_accounts(accounts: list[Account], disabled: set[str]) -> list[Account]:
+    if not disabled:
+        return accounts
+    return [account for account in accounts if account.username not in disabled]
+
+
+def dedupe_accounts(accounts: list[Account]) -> tuple[list[Account], list[str]]:
+    out: list[Account] = []
+    seen: set[str] = set()
+    duplicates: list[str] = []
+    for account in accounts:
+        if account.username in seen:
+            duplicates.append(account.username)
+            continue
+        seen.add(account.username)
+        out.append(account)
+    return out, duplicates
+
+
 
 async def worker(
     wid: int,
@@ -310,6 +362,7 @@ async def worker(
     host: str,
     port: int,
     reconnect_after_short_partial: int,
+    min_reconnect_interval: float,
     login_fail_sleep: float,
     progress: dict,
     quiet: bool,
@@ -318,6 +371,30 @@ async def worker(
     writer = None
     ok = miss = fail = 0
     short_partial_streak = 0
+    audit_block_streak = 0
+    account_disabled = False
+
+    async def wait_for_connect_slot() -> None:
+        while True:
+            async with progress["connect_lock"]:
+                now = time.monotonic()
+                next_connect_at = progress["next_connect_at_by_account"].get(
+                    account.username,
+                    0.0,
+                )
+                wait_for = next_connect_at - now
+                if wait_for <= 0:
+                    progress["next_connect_at_by_account"][account.username] = (
+                        now + min_reconnect_interval
+                    )
+                    return
+            if not quiet:
+                print(
+                    f"account={account.username} throttle reconnect "
+                    f"sleep={wait_for:.1f}s"
+                )
+            await asyncio.sleep(wait_for)
+
     try:
         for pid in ids:
             if progress.get("stop"):
@@ -331,6 +408,7 @@ async def worker(
             while i <= retries:
                 try:
                     if writer is None:
+                        await wait_for_connect_slot()
                         await asyncio.sleep(random.uniform(0.03, 0.2))
                         reader, writer = await telnetlib3.open_connection(
                             host,
@@ -342,6 +420,8 @@ async def worker(
                             shell=None,
                         )
                         await enter_stock(writer, reader, account, board)
+                        if not quiet:
+                            print(f"account={account.username} entered board={board}")
                     raw, st = await read_by_id(writer, reader, pid, short_wait, long_wait)
                     # Unexpectedly fell back to menu/list screen; force reconnect and retry.
                     if raw and ("主选单" in raw or "讨论区 [Test]" in raw):
@@ -350,7 +430,7 @@ async def worker(
                         except Exception:
                             pass
                         reader, writer = None, None
-                        await asyncio.sleep(0.15)
+                        await asyncio.sleep(max(0.15, min_reconnect_interval))
                         fail_reason = "returned_to_menu"
                         i += 1
                         continue
@@ -358,12 +438,12 @@ async def worker(
                     fail_reason = f"login_failed:{e}"
                     append_fail_log(
                         progress["fail_log_file"],
-                        f"post_id={pid}\tworker={wid}\taccount={account.username}"
+                        f"post_id={pid}\taccount={account.username}"
                         f"\treason={fail_reason}\traw_preview=",
                     )
                     if not quiet:
                         print(
-                            f"worker#{wid} account={account.username} login failed; "
+                            f"account={account.username} login failed; "
                             f"sleep {login_fail_sleep:.0f}s before retry"
                         )
                     try:
@@ -378,12 +458,12 @@ async def worker(
                     fail_reason = f"board_enter_failed:{e}"
                     append_fail_log(
                         progress["fail_log_file"],
-                        f"post_id={pid}\tworker={wid}\taccount={account.username}"
+                        f"post_id={pid}\taccount={account.username}"
                         f"\treason={fail_reason}\traw_preview=",
                     )
                     if not quiet:
                         print(
-                            f"worker#{wid} account={account.username} did not enter "
+                            f"account={account.username} did not enter "
                             f"{board}; reconnect"
                         )
                     try:
@@ -392,20 +472,23 @@ async def worker(
                     except Exception:
                         pass
                     reader, writer = None, None
-                    await asyncio.sleep(0.5 + random.uniform(0, 0.5))
+                    await asyncio.sleep(min_reconnect_interval + random.uniform(0, 0.5))
                     i += 1
                     continue
                 except Exception as e:
                     fail_reason = f"exception:{type(e).__name__}:{e}"
                     if not quiet:
-                        print(f"worker#{wid} reconnect on pid={pid}: {e}")
+                        print(f"account={account.username} reconnect on pid={pid}: {e}")
                     try:
                         if writer is not None:
                             writer.close()
                     except Exception:
                         pass
                     reader, writer = None, None
-                    backoff = 0.25 * (2 ** min(i, 3)) + random.uniform(0, 0.25)
+                    backoff = max(
+                        min_reconnect_interval,
+                        0.25 * (2 ** min(i, 3)) + random.uniform(0, 0.25),
+                    )
                     await asyncio.sleep(backoff)
                     i += 1
                     continue
@@ -418,6 +501,7 @@ async def worker(
                 rec = parse_post(raw, pid)
                 if rec:
                     short_partial_streak = 0
+                    audit_block_streak = 0
                     await out_q.put(rec)
                     ok += 1
                     progress["ok"] += 1
@@ -431,9 +515,37 @@ async def worker(
                     break
                 raw_len = len(raw) if raw else 0
                 fail_reason = f"parse_failed status={st} raw_len={raw_len}"
+                if raw and contains_any(raw, AUDIT_BLOCK_MARKERS):
+                    audit_block_streak += 1
+                    fail_reason = (
+                        f"audit_blocked streak={audit_block_streak} "
+                        f"raw_len={raw_len}"
+                    )
+                    if (
+                        progress["max_audit_blocks"] > 0
+                        and audit_block_streak >= progress["max_audit_blocks"]
+                    ):
+                        account_disabled = True
+                        progress["runtime_disabled_accounts"].add(account.username)
+                        try:
+                            if writer is not None:
+                                writer.close()
+                        except Exception:
+                            pass
+                        reader, writer = None, None
+                        if not quiet:
+                            print(
+                                f"account={account.username} disabled after "
+                                f"{audit_block_streak} audit-block responses"
+                    )
+                    break
+                audit_block_streak = 0
                 if st == "partial":
                     short_partial_streak += 1
-                    if short_partial_streak >= reconnect_after_short_partial:
+                    if (
+                        reconnect_after_short_partial > 0
+                        and short_partial_streak >= reconnect_after_short_partial
+                    ):
                         try:
                             if writer is not None:
                                 writer.close()
@@ -443,8 +555,9 @@ async def worker(
                         short_partial_streak = 0
                         if not quiet:
                             print(
-                                f"worker#{wid} reconnect after partial "
-                                f"pid={pid} raw_len={raw_len}"
+                                f"account={account.username} reconnect after partial "
+                                f"pid={pid} raw_len={raw_len}; "
+                                f"sleep at least {min_reconnect_interval:.0f}s"
                             )
                 else:
                     short_partial_streak = 0
@@ -455,16 +568,18 @@ async def worker(
                 progress["fail"] += 1
                 append_fail_log(
                     progress["fail_log_file"],
-                    f"post_id={pid}\tworker={wid}\treason={fail_reason or 'unknown'}"
+                    f"post_id={pid}\taccount={account.username}"
+                    f"\treason={fail_reason or 'unknown'}"
                     f"\traw_preview={format_fail_preview(raw)}",
                 )
-
             progress["done"] += 1
             if (not quiet) and progress["done"] % 50 == 0:
                 print(
                     f"progress done={progress['done']} ok={progress['ok']} "
                     f"miss={progress['miss']} fail={progress['fail']}"
                 )
+            if account_disabled:
+                break
     finally:
         try:
             if writer is not None:
@@ -473,7 +588,7 @@ async def worker(
             pass
 
     if not quiet:
-        print(f"worker#{wid} done ok={ok} miss={miss} fail={fail}")
+        print(f"account={account.username} done ok={ok} miss={miss} fail={fail}")
 
 
 def split_ids_chunk(ids: list[int], n: int) -> list[list[int]]:
@@ -606,6 +721,7 @@ async def sink_writer(
 
 
 def parse_args() -> argparse.Namespace:
+    load_env_file(ROOT / ".env")
     p = argparse.ArgumentParser(description="Parallel SMTH ID scraper -> sqlite")
     p.add_argument("--host", default=os.getenv("SMTH_HOST", "bbs.mysmth.net"))
     p.add_argument("--port", type=int, default=int(os.getenv("SMTH_PORT", "23")))
@@ -617,7 +733,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--db", type=Path, default=Path("data/smth_stock.db"))
     p.add_argument("--sqlite-batch", type=int, default=2000)
     p.add_argument("--accounts", default=os.getenv("SMTH_ACCOUNTS", ""))
-    p.add_argument("--sessions-per-account", type=int, default=1)
+    p.add_argument(
+        "--disabled-accounts",
+        default=os.getenv("SMTH_DISABLED_ACCOUNTS", ""),
+        help="逗号分隔的禁用账号名，即使出现在 --accounts/SMTH_ACCOUNTS 中也不会登录",
+    )
+    p.add_argument("--sessions-per-account", type=int, default=1, help="必须为 1；每个账号严禁多个同时连接")
     p.add_argument("--flush-every", type=int, default=500, help="CSV flush interval when CSV is enabled")
     p.add_argument("--retries", type=int, default=2)
     p.add_argument("--short-wait", type=float, default=0.08)
@@ -625,8 +746,20 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--reconnect-after-short-partial",
         type=int,
-        default=3,
-        help="连续 partial 解析失败后的自动重连阈值，参数名保留用于兼容旧命令",
+        default=int(os.getenv("SMTH_RECONNECT_AFTER_SHORT_PARTIAL", "0")),
+        help="连续 partial 解析失败后的自动重连阈值；0 表示不因 partial 主动重连",
+    )
+    p.add_argument(
+        "--min-reconnect-interval",
+        type=float,
+        default=float(os.getenv("SMTH_MIN_RECONNECT_INTERVAL", "30")),
+        help="同一账号两次连接尝试之间的最小间隔秒数，默认 30",
+    )
+    p.add_argument(
+        "--max-audit-blocks",
+        type=int,
+        default=int(os.getenv("SMTH_MAX_AUDIT_BLOCKS", "3")),
+        help="同一账号连续遇到审核限制提示多少次后停用；0 表示不自动停用",
     )
     p.add_argument("--login-fail-sleep", type=float, default=600, help="登录失败后等待多少秒再重试")
     p.add_argument("--split-mode", choices=["round_robin", "chunk"], default="chunk")
@@ -654,9 +787,24 @@ async def main() -> None:
                 f"lock exists: {args.lock_file} (another run may be active). "
                 "Use --no-lock to bypass."
             )
+    if args.sessions_per_account != 1:
+        raise SystemExit("sessions-per-account must be 1; one account may only have one connection")
+
     accounts = parse_accounts(args.accounts)
+    disabled_accounts = parse_account_names(args.disabled_accounts)
+    before_filter = len(accounts)
+    accounts = filter_disabled_accounts(accounts, disabled_accounts)
+    accounts, duplicate_accounts = dedupe_accounts(accounts)
     if not accounts:
-        raise SystemExit("missing accounts. set --accounts or SMTH_ACCOUNTS")
+        raise SystemExit("missing enabled accounts. set --accounts or SMTH_ACCOUNTS")
+    if not args.quiet:
+        if disabled_accounts:
+            disabled_used = sorted(disabled_accounts)
+            print(f"disabled accounts: {', '.join(disabled_used)}")
+            print(f"enabled accounts: {len(accounts)}/{before_filter}")
+        if duplicate_accounts:
+            print("ignored duplicate accounts: " + ", ".join(sorted(set(duplicate_accounts))))
+        print("using accounts: " + ", ".join(account.username for account in accounts))
 
     if not args.no_resume:
         last_id = read_checkpoint(args.checkpoint_file)
@@ -679,7 +827,7 @@ async def main() -> None:
     elif args.batch_size <= 0:
         raise SystemExit("batch-size must be > 0")
 
-    workers_n = len(accounts) * args.sessions_per_account
+    workers_n = len(accounts)
 
     q: asyncio.Queue = asyncio.Queue(maxsize=5000)
     csv_path = None if args.no_csv else args.csv
@@ -697,6 +845,10 @@ async def main() -> None:
         "until_title_norm": normalize_title(args.until_title) if args.until_title else None,
         "max_seen_id": args.start_id - 1,
         "fail_log_file": args.fail_log_file,
+        "connect_lock": asyncio.Lock(),
+        "next_connect_at_by_account": {},
+        "max_audit_blocks": args.max_audit_blocks,
+        "runtime_disabled_accounts": set(),
     }
 
     args.fail_log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -706,30 +858,30 @@ async def main() -> None:
         tasks_local: list[asyncio.Task] = []
         wid = 0
         for acc in accounts:
-            for _ in range(args.sessions_per_account):
-                if wid >= len(groups):
-                    break
-                tasks_local.append(
-                    asyncio.create_task(
-                        worker(
-                            wid,
-                            acc,
-                            args.board,
-                            groups[wid],
-                            q,
-                            args.retries,
-                            args.short_wait,
-                            args.long_wait,
-                            args.host,
-                            args.port,
-                            args.reconnect_after_short_partial,
-                            args.login_fail_sleep,
-                            progress,
-                            args.quiet,
-                        )
+            if wid >= len(groups):
+                break
+            tasks_local.append(
+                asyncio.create_task(
+                    worker(
+                        wid,
+                        acc,
+                        args.board,
+                        groups[wid],
+                        q,
+                        args.retries,
+                        args.short_wait,
+                        args.long_wait,
+                        args.host,
+                        args.port,
+                        args.reconnect_after_short_partial,
+                        args.min_reconnect_interval,
+                        args.login_fail_sleep,
+                        progress,
+                        args.quiet,
                     )
                 )
-                wid += 1
+            )
+            wid += 1
         return tasks_local
 
     if args.until_title is None:
