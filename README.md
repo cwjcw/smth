@@ -54,6 +54,8 @@ python run_parallel_ids_to_sqlite.py \
   --audit-slowdown-multiplier 2 \
   --max-per-account-interval 15 \
   --recovery-successes 500 \
+  --account-rest-every 250 \
+  --account-rest-seconds 300 \
   --sqlite-batch 50 \
   --audit-block-cooldown 300 \
   --reconnect-after-short-partial 0 \
@@ -80,6 +82,8 @@ python run_parallel_ids_to_sqlite.py \
   --audit-slowdown-multiplier 2 \
   --max-per-account-interval 15 \
   --recovery-successes 500 \
+  --account-rest-every 250 \
+  --account-rest-seconds 300 \
   --sqlite-batch 50 \
   --audit-block-cooldown 300 \
   --reconnect-after-short-partial 0 \
@@ -99,6 +103,8 @@ python run_parallel_ids_to_sqlite.py \
 - `--audit-slowdown-multiplier 2`：账号遇到审核提示后，后续读帖间隔自动翻倍。
 - `--max-per-account-interval 15`：账号自适应降速最多降到每 15 秒一帖。
 - `--recovery-successes 500`：账号连续成功读取 500 条后尝试恢复一档速度。
+- `--account-rest-every 250`：每个账号处理 250 条后主动休息一次。
+- `--account-rest-seconds 300`：主动休息 300 秒，休息期间不主动断开登录连接。
 - `--sqlite-batch 50`：每 50 条提交一次，运行中也能看到数据库逐步有数据。
 - `--audit-block-cooldown 300`：任一账号遇到审核提示时，只暂停该账号 300 秒，然后从遇到审核的帖子继续；其他账号继续抓取。
 - `--reconnect-after-short-partial 0`：partial 返回不主动重连；建议在账号受限时使用。
@@ -123,6 +129,8 @@ python run_parallel_ids_to_sqlite.py \
   --audit-slowdown-multiplier 2 \
   --max-per-account-interval 15 \
   --recovery-successes 500 \
+  --account-rest-every 250 \
+  --account-rest-seconds 300 \
   --sqlite-batch 50 \
   --audit-block-cooldown 300 \
   --reconnect-after-short-partial 0 \
@@ -161,6 +169,8 @@ python run_parallel_ids_to_sqlite.py \
 - 推荐先用保守频率：每个账号两次读帖之间至少间隔 `3` 秒，并额外加入 `0` 到 `1` 秒随机抖动。
 - 多账号并行时总速率约等于账号数除以单账号间隔；例如 3 个账号保守参数约每秒 1 条左右。
 - 如果某个账号遇到审核提示，该账号的读帖间隔会自动翻倍，最高到 `15` 秒；连续成功读取 `500` 条后再逐步恢复速度。
+- 根据当前日志，首次审核大约出现在全局 900-1000 条附近；3 个账号并行折算约每账号 300 条。推荐先按每账号 `250` 条主动休息 `300` 秒，给站点侧留出缓冲。
+- 主动休息只暂停对应账号 worker，不主动关闭 telnet 连接；如果连接在休息期间被服务端断开，下一次读取会按原有重连逻辑恢复。
 - 如果连续运行稳定、没有审核提示，再逐步把 `--per-account-interval` 降到 `2` 或 `1.5`；如果仍频繁遇到审核提示，则调到 `5`。
 
 ## checkpoint 安全
@@ -186,6 +196,8 @@ python run_parallel_ids_to_sqlite.py \
 - `--audit-slowdown-multiplier`：账号遇到审核提示后读帖间隔放大倍数，默认 `2`；也可设置 `SMTH_AUDIT_SLOWDOWN_MULTIPLIER`。
 - `--max-per-account-interval`：账号自适应降速后的最大读帖间隔秒数，默认 `15`；也可设置 `SMTH_MAX_PER_ACCOUNT_INTERVAL`。
 - `--recovery-successes`：账号连续成功读取多少条后尝试恢复一档速度，默认 `500`；也可设置 `SMTH_RECOVERY_SUCCESSES`。
+- `--account-rest-every`：单个账号每处理多少条后主动休息，默认 `250`；`0` 表示关闭，也可设置 `SMTH_ACCOUNT_REST_EVERY`。
+- `--account-rest-seconds`：单个账号主动休息秒数，默认 `300`；也可设置 `SMTH_ACCOUNT_REST_SECONDS`。
 - `--reconnect-after-short-partial`：连续 partial 返回后的自动重连阈值；`0` 表示不因 partial 主动重连。
 - `--min-reconnect-interval`：同一账号两次连接尝试之间的最小间隔秒数；也可设置 `SMTH_MIN_RECONNECT_INTERVAL`。
 - `--audit-block-cooldown`：单个账号遇到审核提示后的暂停秒数，默认 `300`；也可设置 `SMTH_AUDIT_BLOCK_COOLDOWN`。

@@ -391,6 +391,8 @@ async def worker(
     audit_slowdown_multiplier: float,
     max_per_account_interval: float,
     recovery_successes: int,
+    account_rest_every: int,
+    account_rest_seconds: float,
     audit_block_cooldown: float,
     reconnect_after_short_partial: int,
     min_reconnect_interval: float,
@@ -525,6 +527,25 @@ async def worker(
                 f"pause this account {wait_for:.1f}s then retry same pid"
             )
         await asyncio.sleep(wait_for)
+
+    async def maybe_account_rest() -> None:
+        if account_rest_every <= 0 or account_rest_seconds <= 0:
+            return
+        async with progress["account_rest_lock"]:
+            done_since_rest = progress["done_since_rest_by_account"].get(
+                account.username,
+                0,
+            ) + 1
+            if done_since_rest < account_rest_every:
+                progress["done_since_rest_by_account"][account.username] = done_since_rest
+                return
+            progress["done_since_rest_by_account"][account.username] = 0
+        if not quiet:
+            print(
+                f"account={account.username} proactive rest after "
+                f"{account_rest_every} posts; sleep={account_rest_seconds:.0f}s"
+            )
+        await asyncio.sleep(account_rest_seconds)
 
     async def mark_completed(post_id: int) -> None:
         async with progress["checkpoint_lock"]:
@@ -721,6 +742,7 @@ async def worker(
                 )
             progress["done"] += 1
             await mark_completed(pid)
+            await maybe_account_rest()
             if (not quiet) and progress["done"] % 50 == 0:
                 print(
                     f"progress done={progress['done']} ok={progress['ok']} "
@@ -926,6 +948,18 @@ def parse_args() -> argparse.Namespace:
         help="账号连续成功读取多少条后尝试恢复一档速度，默认 500",
     )
     p.add_argument(
+        "--account-rest-every",
+        type=int,
+        default=int(os.getenv("SMTH_ACCOUNT_REST_EVERY", "250")),
+        help="单个账号每处理多少条后主动休息；0 表示关闭，默认 250",
+    )
+    p.add_argument(
+        "--account-rest-seconds",
+        type=float,
+        default=float(os.getenv("SMTH_ACCOUNT_REST_SECONDS", "300")),
+        help="单个账号主动休息秒数，默认 300",
+    )
+    p.add_argument(
         "--reconnect-after-short-partial",
         type=int,
         default=int(os.getenv("SMTH_RECONNECT_AFTER_SHORT_PARTIAL", "0")),
@@ -1037,6 +1071,10 @@ async def main() -> None:
         raise SystemExit("max-per-account-interval must be >= per-account-interval")
     if args.recovery_successes < 0:
         raise SystemExit("recovery-successes must be >= 0")
+    if args.account_rest_every < 0:
+        raise SystemExit("account-rest-every must be >= 0")
+    if args.account_rest_seconds < 0:
+        raise SystemExit("account-rest-seconds must be >= 0")
 
     workers_n = len(accounts)
 
@@ -1062,6 +1100,8 @@ async def main() -> None:
         "next_request_at_by_account": {},
         "request_interval_by_account": {},
         "healthy_reads_by_account": {},
+        "account_rest_lock": asyncio.Lock(),
+        "done_since_rest_by_account": {},
         "verbose_throttle": args.verbose_throttle,
         "audit_cooldown_lock": asyncio.Lock(),
         "audit_cooldown_until_by_account": {},
@@ -1098,6 +1138,8 @@ async def main() -> None:
                         args.audit_slowdown_multiplier,
                         args.max_per_account_interval,
                         args.recovery_successes,
+                        args.account_rest_every,
+                        args.account_rest_seconds,
                         args.audit_block_cooldown,
                         args.reconnect_after_short_partial,
                         args.min_reconnect_interval,
@@ -1132,6 +1174,8 @@ async def main() -> None:
                         args.audit_slowdown_multiplier,
                         args.max_per_account_interval,
                         args.recovery_successes,
+                        args.account_rest_every,
+                        args.account_rest_seconds,
                         args.audit_block_cooldown,
                         args.reconnect_after_short_partial,
                         args.min_reconnect_interval,
