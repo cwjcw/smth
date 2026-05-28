@@ -48,6 +48,7 @@ python run_parallel_ids_to_sqlite.py \
   --retries 1 \
   --short-wait 0.15 \
   --long-wait 0.45 \
+  --idle-timeout 0.06 \
   --sqlite-batch 50 \
   --reconnect-after-short-partial 0 \
   --min-reconnect-interval 60 \
@@ -67,6 +68,7 @@ python run_parallel_ids_to_sqlite.py \
   --retries 1 \
   --short-wait 0.15 \
   --long-wait 0.45 \
+  --idle-timeout 0.06 \
   --sqlite-batch 50 \
   --reconnect-after-short-partial 0 \
   --min-reconnect-interval 60 \
@@ -79,6 +81,7 @@ python run_parallel_ids_to_sqlite.py \
 - `--no-csv`：只写 SQLite，不生成 CSV。
 - `--sessions-per-account 1`：每个 SMTH 账号只允许 1 个连接；传其他值会拒绝运行。
 - `--split-mode round_robin`：多个账号轮流分配 ID。
+- `--idle-timeout 0.06`：读取到数据后，如果连续 0.06 秒没有新数据，就立刻进入下一步；网络慢或 partial 增多时可调到 `0.08`/`0.10`。
 - `--sqlite-batch 50`：每 50 条提交一次，运行中也能看到数据库逐步有数据。
 - `--reconnect-after-short-partial 0`：partial 返回不主动重连；建议在账号受限时使用。
 - `--min-reconnect-interval 60`：同一账号两次连接尝试至少间隔 60 秒。
@@ -96,6 +99,7 @@ python run_parallel_ids_to_sqlite.py \
   --retries 1 \
   --short-wait 0.15 \
   --long-wait 0.45 \
+  --idle-timeout 0.06 \
   --sqlite-batch 50 \
   --reconnect-after-short-partial 0 \
   --min-reconnect-interval 60
@@ -140,6 +144,7 @@ python run_parallel_ids_to_sqlite.py \
 - `--no-csv`：不输出 CSV（推荐大批量时开启）
 - `--csv`：CSV 路径（不加 `--no-csv` 时生效）
 - `--sqlite-batch`：SQLite 批量写入大小；正式运行建议 `50`
+- `--idle-timeout`：读取响应时的数据空闲判断秒数，默认 `0.06`；也可设置 `SMTH_IDLE_TIMEOUT`。
 - `--reconnect-after-short-partial`：连续 partial 返回后的自动重连阈值；`0` 表示不因 partial 主动重连。
 - `--min-reconnect-interval`：同一账号两次连接尝试之间的最小间隔秒数；也可设置 `SMTH_MIN_RECONNECT_INTERVAL`。
 - `--max-audit-blocks`：同一账号连续遇到审核限制提示多少次后停用；默认 `3`。

@@ -95,17 +95,28 @@ def clean(s: str) -> str:
     return ANSI_RE.sub("", s).replace("\r", "")
 
 
-async def rd(reader: telnetlib3.TelnetReader, sec: float = 0.8) -> str:
-    end = time.time() + sec
+async def rd(
+    reader: telnetlib3.TelnetReader,
+    sec: float = 0.8,
+    idle_timeout: float = 0.06,
+) -> str:
+    start = time.monotonic()
+    end = start + sec
+    hard_end = start + max(sec * 2, sec + 1.0)
     out: list[str] = []
-    while time.time() < end:
+    saw_data = False
+    while time.monotonic() < end:
+        timeout = idle_timeout if saw_data else min(0.1, end - time.monotonic())
         try:
-            d = await asyncio.wait_for(reader.read(1), timeout=0.1)
+            d = await asyncio.wait_for(reader.read(4096), timeout=max(timeout, 0.001))
         except asyncio.TimeoutError:
+            if saw_data:
+                break
             continue
         if d:
             out.append(d)
-            end = min(end + 0.08, time.time() + 0.35)
+            saw_data = True
+            end = min(max(end, time.monotonic() + idle_timeout), hard_end)
     return clean("".join(out))
 
 
@@ -235,35 +246,41 @@ def release_lock(lock_file: Path) -> None:
         pass
 
 
-async def enter_stock(writer: telnetlib3.TelnetWriter, reader: telnetlib3.TelnetReader, account: Account, board: str) -> None:
+async def enter_stock(
+    writer: telnetlib3.TelnetWriter,
+    reader: telnetlib3.TelnetReader,
+    account: Account,
+    board: str,
+    idle_timeout: float,
+) -> None:
     seen: list[str] = []
-    seen.append(await rd(reader, 2.8))
+    seen.append(await rd(reader, 2.8, idle_timeout))
     await send(writer, account.username + "\r\n")
-    seen.append(await rd(reader, 1.2))
+    seen.append(await rd(reader, 1.2, idle_timeout))
     await send(writer, account.password + "\r\n")
-    t = await rd(reader, 1.8)
+    t = await rd(reader, 1.8, idle_timeout)
     seen.append(t)
     merged = "\n".join(seen)
     if contains_any(merged, LOGIN_FAIL_MARKERS):
         raise LoginFailed(format_fail_preview(merged))
     if "窗口数过多" in t or "踢除" in t:
         await send(writer, "1\r\n")
-        seen.append(await rd(reader, 1.2))
+        seen.append(await rd(reader, 1.2, idle_timeout))
 
     await send(writer, "\r\n")
-    seen.append(await rd(reader, 0.8))
+    seen.append(await rd(reader, 0.8, idle_timeout))
     await send(writer, "\r\n")
-    seen.append(await rd(reader, 0.8))
+    seen.append(await rd(reader, 0.8, idle_timeout))
     for _ in range(4):
         await send(writer, " ")
-        seen.append(await rd(reader, 0.8))
+        seen.append(await rd(reader, 0.8, idle_timeout))
 
     await send(writer, "f")
-    seen.append(await rd(reader, 0.6))
+    seen.append(await rd(reader, 0.6, idle_timeout))
     await send(writer, "\r\n")
-    seen.append(await rd(reader, 0.8))
+    seen.append(await rd(reader, 0.8, idle_timeout))
     await send(writer, "\r\n")
-    seen.append(await rd(reader, 1.2))
+    seen.append(await rd(reader, 1.2, idle_timeout))
 
     merged = "\n".join(seen)
     if contains_any(merged, LOGIN_FAIL_MARKERS):
@@ -272,46 +289,53 @@ async def enter_stock(writer: telnetlib3.TelnetWriter, reader: telnetlib3.Telnet
         raise BoardEnterFailed(format_fail_preview(merged))
 
 
-async def read_by_id(writer: telnetlib3.TelnetWriter, reader: telnetlib3.TelnetReader, pid: int, short_wait: float, long_wait: float) -> tuple[str | None, str]:
+async def read_by_id(
+    writer: telnetlib3.TelnetWriter,
+    reader: telnetlib3.TelnetReader,
+    pid: int,
+    short_wait: float,
+    long_wait: float,
+    idle_timeout: float,
+) -> tuple[str | None, str]:
     await send(writer, f"{pid}")
-    await rd(reader, short_wait)
+    await rd(reader, short_wait, idle_timeout)
     await send(writer, "\r\n")
-    await rd(reader, long_wait)
+    await rd(reader, long_wait, idle_timeout)
     await send(writer, "\r\n")
-    t_open = await rd(reader, long_wait)
+    t_open = await rd(reader, long_wait, idle_timeout)
 
     chunks: list[str] = [t_open] if t_open else []
     merged = "\n".join(chunks)
 
     if any(x in merged for x in ["没有这篇", "不存在", "找不到", "No such"]):
         await send(writer, "\x1b[D")
-        await rd(reader, short_wait)
+        await rd(reader, short_wait, idle_timeout)
         return None, "miss"
     if "FROM:" in merged or "[阅读文章]" in merged:
         await send(writer, "\x1b[D")
-        await rd(reader, short_wait)
+        await rd(reader, short_wait, idle_timeout)
         return merged, "ok"
 
     for _ in range(20):
-        t = await rd(reader, short_wait)
+        t = await rd(reader, short_wait, idle_timeout)
         if t:
             chunks.append(t)
         merged = "\n".join(chunks)
 
         if any(x in merged for x in ["没有这篇", "不存在", "找不到", "No such"]):
             await send(writer, "\x1b[D")
-            await rd(reader, short_wait)
+            await rd(reader, short_wait, idle_timeout)
             return None, "miss"
         if "FROM:" in merged or "[阅读文章]" in merged:
             await send(writer, "\x1b[D")
-            await rd(reader, short_wait)
+            await rd(reader, short_wait, idle_timeout)
             return merged, "ok"
         if ("下面还有喔" in merged) or ("按空格" in merged) or ("(SPACE)" in merged):
             await send(writer, " ")
             continue
 
     await send(writer, "\x1b[D")
-    await rd(reader, short_wait)
+    await rd(reader, short_wait, idle_timeout)
     return "\n".join(chunks), "partial"
 
 
@@ -361,6 +385,7 @@ async def worker(
     long_wait: float,
     host: str,
     port: int,
+    idle_timeout: float,
     reconnect_after_short_partial: int,
     min_reconnect_interval: float,
     login_fail_sleep: float,
@@ -432,10 +457,17 @@ async def worker(
                             encoding_errors="ignore",
                             shell=None,
                         )
-                        await enter_stock(writer, reader, account, board)
+                        await enter_stock(writer, reader, account, board, idle_timeout)
                         if not quiet:
                             print(f"account={account.username} entered board={board}")
-                    raw, st = await read_by_id(writer, reader, pid, short_wait, long_wait)
+                    raw, st = await read_by_id(
+                        writer,
+                        reader,
+                        pid,
+                        short_wait,
+                        long_wait,
+                        idle_timeout,
+                    )
                     # Unexpectedly fell back to menu/list screen; force reconnect and retry.
                     if raw and ("主选单" in raw or "讨论区 [Test]" in raw):
                         try:
@@ -757,6 +789,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--short-wait", type=float, default=0.08)
     p.add_argument("--long-wait", type=float, default=0.25)
     p.add_argument(
+        "--idle-timeout",
+        type=float,
+        default=float(os.getenv("SMTH_IDLE_TIMEOUT", "0.06")),
+        help="读取到数据后，连续空闲多少秒即认为本次响应结束，默认 0.06",
+    )
+    p.add_argument(
         "--reconnect-after-short-partial",
         type=int,
         default=int(os.getenv("SMTH_RECONNECT_AFTER_SHORT_PARTIAL", "0")),
@@ -886,6 +924,7 @@ async def main() -> None:
                         args.long_wait,
                         args.host,
                         args.port,
+                        args.idle_timeout,
                         args.reconnect_after_short_partial,
                         args.min_reconnect_interval,
                         args.login_fail_sleep,
@@ -913,6 +952,7 @@ async def main() -> None:
                         args.long_wait,
                         args.host,
                         args.port,
+                        args.idle_timeout,
                         args.reconnect_after_short_partial,
                         args.min_reconnect_interval,
                         args.login_fail_sleep,
