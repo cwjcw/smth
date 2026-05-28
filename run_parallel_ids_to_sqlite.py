@@ -386,6 +386,12 @@ async def worker(
     host: str,
     port: int,
     idle_timeout: float,
+    per_account_interval: float,
+    request_jitter: float,
+    audit_slowdown_multiplier: float,
+    max_per_account_interval: float,
+    recovery_successes: int,
+    audit_block_cooldown: float,
     reconnect_after_short_partial: int,
     min_reconnect_interval: float,
     login_fail_sleep: float,
@@ -396,8 +402,6 @@ async def worker(
     writer = None
     ok = miss = fail = 0
     short_partial_streak = 0
-    audit_block_streak = 0
-    account_disabled = False
     id_queue = ids if isinstance(ids, asyncio.Queue) else None
     id_iter = iter(ids) if id_queue is None else None
 
@@ -422,6 +426,115 @@ async def worker(
                 )
             await asyncio.sleep(wait_for)
 
+    async def wait_for_request_slot() -> None:
+        while True:
+            async with progress["request_lock"]:
+                now = time.monotonic()
+                current_interval = progress["request_interval_by_account"].get(
+                    account.username,
+                    per_account_interval,
+                )
+                next_request_at = progress["next_request_at_by_account"].get(
+                    account.username,
+                    0.0,
+                )
+                wait_for = next_request_at - now
+                if wait_for <= 0:
+                    delay = current_interval
+                    if request_jitter > 0:
+                        delay += random.uniform(0, request_jitter)
+                    progress["next_request_at_by_account"][account.username] = now + delay
+                    return
+            if (not quiet) and progress.get("verbose_throttle"):
+                print(
+                    f"account={account.username} throttle request "
+                    f"sleep={wait_for:.1f}s"
+                )
+            await asyncio.sleep(wait_for)
+
+    async def record_healthy_read() -> None:
+        async with progress["request_lock"]:
+            current_interval = progress["request_interval_by_account"].get(
+                account.username,
+                per_account_interval,
+            )
+            if current_interval <= per_account_interval:
+                return
+            successes = progress["healthy_reads_by_account"].get(account.username, 0) + 1
+            if recovery_successes <= 0 or successes < recovery_successes:
+                progress["healthy_reads_by_account"][account.username] = successes
+                return
+            new_interval = max(per_account_interval, current_interval / audit_slowdown_multiplier)
+            progress["request_interval_by_account"][account.username] = new_interval
+            progress["healthy_reads_by_account"][account.username] = 0
+        if not quiet:
+            print(
+                f"account={account.username} recovered request interval "
+                f"{current_interval:.1f}s -> {new_interval:.1f}s"
+            )
+
+    async def record_audit_slowdown() -> None:
+        async with progress["request_lock"]:
+            current_interval = progress["request_interval_by_account"].get(
+                account.username,
+                per_account_interval,
+            )
+            new_interval = min(
+                max_per_account_interval,
+                max(per_account_interval, current_interval) * audit_slowdown_multiplier,
+            )
+            progress["request_interval_by_account"][account.username] = new_interval
+            progress["healthy_reads_by_account"][account.username] = 0
+        if not quiet:
+            print(
+                f"account={account.username} slow request interval "
+                f"{current_interval:.1f}s -> {new_interval:.1f}s"
+            )
+
+    async def wait_for_account_audit_cooldown() -> None:
+        while True:
+            async with progress["audit_cooldown_lock"]:
+                cooldown_until = progress["audit_cooldown_until_by_account"].get(
+                    account.username,
+                    0.0,
+                )
+                wait_for = cooldown_until - time.monotonic()
+            if wait_for <= 0:
+                return
+            if not quiet:
+                print(
+                    f"account={account.username} audit-block cooldown "
+                    f"sleep={wait_for:.1f}s"
+                )
+            await asyncio.sleep(wait_for)
+
+    async def start_account_audit_cooldown(pid: int, raw_len: int) -> None:
+        async with progress["audit_cooldown_lock"]:
+            now = time.monotonic()
+            until = now + audit_block_cooldown
+            current_until = progress["audit_cooldown_until_by_account"].get(
+                account.username,
+                0.0,
+            )
+            if until > current_until:
+                progress["audit_cooldown_until_by_account"][account.username] = until
+            wait_for = progress["audit_cooldown_until_by_account"][account.username] - now
+        if not quiet:
+            print(
+                f"account={account.username} audit-block pid={pid} raw_len={raw_len}; "
+                f"pause this account {wait_for:.1f}s then retry same pid"
+            )
+        await asyncio.sleep(wait_for)
+
+    async def mark_completed(post_id: int) -> None:
+        async with progress["checkpoint_lock"]:
+            progress["completed_ids"].add(post_id)
+            next_id = progress["checkpoint_contiguous_id"] + 1
+            while next_id in progress["completed_ids"]:
+                progress["completed_ids"].remove(next_id)
+                progress["checkpoint_contiguous_id"] = next_id
+                next_id += 1
+
     try:
         while True:
             if id_queue is None:
@@ -445,6 +558,7 @@ async def worker(
             i = 0
             while i <= retries:
                 try:
+                    await wait_for_account_audit_cooldown()
                     if writer is None:
                         await wait_for_connect_slot()
                         await asyncio.sleep(random.uniform(0.03, 0.2))
@@ -460,6 +574,7 @@ async def worker(
                         await enter_stock(writer, reader, account, board, idle_timeout)
                         if not quiet:
                             print(f"account={account.username} entered board={board}")
+                    await wait_for_request_slot()
                     raw, st = await read_by_id(
                         writer,
                         reader,
@@ -541,15 +656,16 @@ async def worker(
                 if st == "miss" or raw is None:
                     miss += 1
                     progress["miss"] += 1
+                    await record_healthy_read()
                     success = True
                     break
                 rec = parse_post(raw, pid)
                 if rec:
                     short_partial_streak = 0
-                    audit_block_streak = 0
                     await out_q.put(rec)
                     ok += 1
                     progress["ok"] += 1
+                    await record_healthy_read()
                     if progress.get("until_title_norm"):
                         title_norm = normalize_title(rec[3])
                         if progress["until_title_norm"] in title_norm:
@@ -561,30 +677,16 @@ async def worker(
                 raw_len = len(raw) if raw else 0
                 fail_reason = f"parse_failed status={st} raw_len={raw_len}"
                 if raw and contains_any(raw, AUDIT_BLOCK_MARKERS):
-                    audit_block_streak += 1
-                    fail_reason = (
-                        f"audit_blocked streak={audit_block_streak} "
-                        f"raw_len={raw_len}"
-                    )
-                    if (
-                        progress["max_audit_blocks"] > 0
-                        and audit_block_streak >= progress["max_audit_blocks"]
-                    ):
-                        account_disabled = True
-                        progress["runtime_disabled_accounts"].add(account.username)
-                        try:
-                            if writer is not None:
-                                writer.close()
-                        except Exception:
-                            pass
-                        reader, writer = None, None
-                        if not quiet:
-                            print(
-                                f"account={account.username} disabled after "
-                                f"{audit_block_streak} audit-block responses"
-                    )
-                    break
-                audit_block_streak = 0
+                    fail_reason = f"audit_blocked cooldown={audit_block_cooldown:.1f} raw_len={raw_len}"
+                    await record_audit_slowdown()
+                    try:
+                        if writer is not None:
+                            writer.close()
+                    except Exception:
+                        pass
+                    reader, writer = None, None
+                    await start_account_audit_cooldown(pid, raw_len)
+                    continue
                 if st == "partial":
                     short_partial_streak += 1
                     if (
@@ -618,13 +720,12 @@ async def worker(
                     f"\traw_preview={format_fail_preview(raw)}",
                 )
             progress["done"] += 1
+            await mark_completed(pid)
             if (not quiet) and progress["done"] % 50 == 0:
                 print(
                     f"progress done={progress['done']} ok={progress['ok']} "
                     f"miss={progress['miss']} fail={progress['fail']}"
                 )
-            if account_disabled:
-                break
     finally:
         try:
             if writer is not None:
@@ -795,6 +896,36 @@ def parse_args() -> argparse.Namespace:
         help="读取到数据后，连续空闲多少秒即认为本次响应结束，默认 0.06",
     )
     p.add_argument(
+        "--per-account-interval",
+        type=float,
+        default=float(os.getenv("SMTH_PER_ACCOUNT_INTERVAL", "3")),
+        help="同一账号两次读帖之间的最小间隔秒数，默认 3",
+    )
+    p.add_argument(
+        "--request-jitter",
+        type=float,
+        default=float(os.getenv("SMTH_REQUEST_JITTER", "1")),
+        help="每次读帖间隔额外随机抖动秒数，默认 1",
+    )
+    p.add_argument(
+        "--audit-slowdown-multiplier",
+        type=float,
+        default=float(os.getenv("SMTH_AUDIT_SLOWDOWN_MULTIPLIER", "2")),
+        help="账号遇到审核提示后读帖间隔放大倍数，默认 2",
+    )
+    p.add_argument(
+        "--max-per-account-interval",
+        type=float,
+        default=float(os.getenv("SMTH_MAX_PER_ACCOUNT_INTERVAL", "15")),
+        help="账号自适应降速后的最大读帖间隔秒数，默认 15",
+    )
+    p.add_argument(
+        "--recovery-successes",
+        type=int,
+        default=int(os.getenv("SMTH_RECOVERY_SUCCESSES", "500")),
+        help="账号连续成功读取多少条后尝试恢复一档速度，默认 500",
+    )
+    p.add_argument(
         "--reconnect-after-short-partial",
         type=int,
         default=int(os.getenv("SMTH_RECONNECT_AFTER_SHORT_PARTIAL", "0")),
@@ -810,7 +941,25 @@ def parse_args() -> argparse.Namespace:
         "--max-audit-blocks",
         type=int,
         default=int(os.getenv("SMTH_MAX_AUDIT_BLOCKS", "3")),
-        help="同一账号连续遇到审核限制提示多少次后停用；0 表示不自动停用",
+        help="兼容旧参数；当前不再因审核提示停用账号",
+    )
+    p.add_argument(
+        "--audit-block-retries",
+        type=int,
+        default=int(os.getenv("SMTH_AUDIT_BLOCK_RETRIES", "3")),
+        help="兼容旧参数；当前遇到审核提示会触发账号冷却后重试同一帖",
+    )
+    p.add_argument(
+        "--audit-block-wait",
+        type=float,
+        default=float(os.getenv("SMTH_AUDIT_BLOCK_WAIT", "2")),
+        help="兼容旧参数；当前遇到审核提示会触发账号冷却后重试同一帖",
+    )
+    p.add_argument(
+        "--audit-block-cooldown",
+        type=float,
+        default=float(os.getenv("SMTH_AUDIT_BLOCK_COOLDOWN", "300")),
+        help="单个账号遇到全站审核提示后的暂停秒数，默认 300",
     )
     p.add_argument("--login-fail-sleep", type=float, default=600, help="登录失败后等待多少秒再重试")
     p.add_argument("--split-mode", choices=["round_robin", "chunk"], default="chunk")
@@ -821,6 +970,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lock-file", type=Path, default=Path("data/smth_stock.run.lock"))
     p.add_argument("--no-lock", action="store_true", help="不启用单实例锁")
     p.add_argument("--no-resume", action="store_true", help="忽略 checkpoint，从 --start-id 开始")
+    p.add_argument("--verbose-throttle", action="store_true", help="打印每次读帖节流等待日志")
     p.add_argument("--quiet", action="store_true")
     return p.parse_args()
 
@@ -877,6 +1027,16 @@ async def main() -> None:
             raise SystemExit("end-id must be >= start-id")
     elif args.batch_size <= 0:
         raise SystemExit("batch-size must be > 0")
+    if args.per_account_interval < 0:
+        raise SystemExit("per-account-interval must be >= 0")
+    if args.request_jitter < 0:
+        raise SystemExit("request-jitter must be >= 0")
+    if args.audit_slowdown_multiplier <= 1:
+        raise SystemExit("audit-slowdown-multiplier must be > 1")
+    if args.max_per_account_interval < args.per_account_interval:
+        raise SystemExit("max-per-account-interval must be >= per-account-interval")
+    if args.recovery_successes < 0:
+        raise SystemExit("recovery-successes must be >= 0")
 
     workers_n = len(accounts)
 
@@ -898,8 +1058,16 @@ async def main() -> None:
         "fail_log_file": args.fail_log_file,
         "connect_lock": asyncio.Lock(),
         "next_connect_at_by_account": {},
-        "max_audit_blocks": args.max_audit_blocks,
-        "runtime_disabled_accounts": set(),
+        "request_lock": asyncio.Lock(),
+        "next_request_at_by_account": {},
+        "request_interval_by_account": {},
+        "healthy_reads_by_account": {},
+        "verbose_throttle": args.verbose_throttle,
+        "audit_cooldown_lock": asyncio.Lock(),
+        "audit_cooldown_until_by_account": {},
+        "checkpoint_lock": asyncio.Lock(),
+        "checkpoint_contiguous_id": args.start_id - 1,
+        "completed_ids": set(),
     }
 
     args.fail_log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -925,6 +1093,12 @@ async def main() -> None:
                         args.host,
                         args.port,
                         args.idle_timeout,
+                        args.per_account_interval,
+                        args.request_jitter,
+                        args.audit_slowdown_multiplier,
+                        args.max_per_account_interval,
+                        args.recovery_successes,
+                        args.audit_block_cooldown,
                         args.reconnect_after_short_partial,
                         args.min_reconnect_interval,
                         args.login_fail_sleep,
@@ -953,6 +1127,12 @@ async def main() -> None:
                         args.host,
                         args.port,
                         args.idle_timeout,
+                        args.per_account_interval,
+                        args.request_jitter,
+                        args.audit_slowdown_multiplier,
+                        args.max_per_account_interval,
+                        args.recovery_successes,
+                        args.audit_block_cooldown,
                         args.reconnect_after_short_partial,
                         args.min_reconnect_interval,
                         args.login_fail_sleep,
@@ -965,18 +1145,11 @@ async def main() -> None:
 
     async def feed_until_ids(id_q: asyncio.Queue) -> None:
         cursor = args.start_id
-        disabled_all = False
         while not progress["stop"]:
-            disabled_all = (
-                len(progress["runtime_disabled_accounts"]) >= workers_n
-            )
-            if disabled_all:
-                break
             await id_q.put(cursor)
             cursor += 1
-        if not disabled_all:
-            for _ in range(workers_n):
-                await id_q.put(None)
+        for _ in range(workers_n):
+            await id_q.put(None)
 
     async def monitor_until_progress(done_event: asyncio.Event) -> None:
         last_checkpoint = args.start_id - 1
@@ -986,9 +1159,11 @@ async def main() -> None:
                 await asyncio.wait_for(done_event.wait(), timeout=5.0)
             except asyncio.TimeoutError:
                 pass
-            if progress["max_seen_id"] > last_checkpoint:
-                write_checkpoint(args.checkpoint_file, progress["max_seen_id"])
-                last_checkpoint = progress["max_seen_id"]
+            async with progress["checkpoint_lock"]:
+                checkpoint_id = progress["checkpoint_contiguous_id"]
+            if checkpoint_id > last_checkpoint:
+                write_checkpoint(args.checkpoint_file, checkpoint_id)
+                last_checkpoint = checkpoint_id
             should_report = (
                 progress["done"] - last_report_done >= args.batch_size
                 or (done_event.is_set() and progress["done"] > last_report_done)
@@ -996,6 +1171,7 @@ async def main() -> None:
             if (not args.quiet) and should_report:
                 print(
                     f"until-progress scanned_to={progress['max_seen_id']} "
+                    f"checkpoint_to={checkpoint_id} "
                     f"ok={progress['ok']} miss={progress['miss']} fail={progress['fail']}"
                 )
                 last_report_done = progress["done"]
@@ -1010,8 +1186,10 @@ async def main() -> None:
         ids = list(range(args.start_id, args.end_id + 1))
         groups = split_ids_chunk(ids, workers_n) if args.split_mode == "chunk" else split_ids_round_robin(ids, workers_n)
         await asyncio.gather(*build_tasks(groups))
-        if progress["max_seen_id"] >= args.start_id:
-            write_checkpoint(args.checkpoint_file, progress["max_seen_id"])
+        async with progress["checkpoint_lock"]:
+            checkpoint_id = progress["checkpoint_contiguous_id"]
+        if checkpoint_id >= args.start_id:
+            write_checkpoint(args.checkpoint_file, checkpoint_id)
         target_total = len(ids)
     else:
         id_q: asyncio.Queue = asyncio.Queue(maxsize=args.batch_size)
